@@ -44,10 +44,10 @@ jobs:
         run: ./build.sh
 
       - name: Run WASM middleware unit tests
-        run: cargo test --lib wasm_middleware:: -- --nocapture
+        run: "cargo test --lib wasm_middleware:: -- --nocapture"
 
       - name: Run WASM middleware Rust integration tests
-        run: cargo test --test test_wasm_middleware -- --nocapture
+        run: "cargo test --test test_wasm_middleware -- --nocapture"
 
       - name: Build router binary for integration tests
         run: cargo build --release --bin vllm-router

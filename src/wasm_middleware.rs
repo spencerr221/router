@@ -8,7 +8,6 @@
 use std::collections::HashSet;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -263,27 +262,11 @@ struct RuntimeInner {
     queue_tx: async_channel::Sender<InvokeRequest>,
     _workers: Vec<std::thread::JoinHandle<()>>,
     queue_permits: Arc<Semaphore>,
-    invocations: AtomicU64,
-    continues: AtomicU64,
-    modifies: AtomicU64,
-    rejects: AtomicU64,
-    traps: AtomicU64,
-    timeouts: AtomicU64,
 }
 
 #[derive(Clone)]
 pub struct WasmMiddlewareRuntime {
     inner: Arc<RuntimeInner>,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct WasmRuntimeMetrics {
-    pub invocations: u64,
-    pub continues: u64,
-    pub modifies: u64,
-    pub rejects: u64,
-    pub traps: u64,
-    pub timeouts: u64,
 }
 
 impl WasmMiddlewareRuntime {
@@ -371,12 +354,6 @@ impl WasmMiddlewareRuntime {
                 queue_tx,
                 _workers: workers,
                 queue_permits,
-                invocations: AtomicU64::new(0),
-                continues: AtomicU64::new(0),
-                modifies: AtomicU64::new(0),
-                rejects: AtomicU64::new(0),
-                traps: AtomicU64::new(0),
-                timeouts: AtomicU64::new(0),
             }),
         })
     }
@@ -391,17 +368,6 @@ impl WasmMiddlewareRuntime {
 
     pub fn matches_route(&self, path: &str) -> bool {
         self.inner.route_set.contains(path)
-    }
-
-    pub fn metrics(&self) -> WasmRuntimeMetrics {
-        WasmRuntimeMetrics {
-            invocations: self.inner.invocations.load(Ordering::Relaxed),
-            continues: self.inner.continues.load(Ordering::Relaxed),
-            modifies: self.inner.modifies.load(Ordering::Relaxed),
-            rejects: self.inner.rejects.load(Ordering::Relaxed),
-            traps: self.inner.traps.load(Ordering::Relaxed),
-            timeouts: self.inner.timeouts.load(Ordering::Relaxed),
-        }
     }
 
     pub async fn handle_request(
@@ -434,26 +400,6 @@ impl WasmMiddlewareRuntime {
             .await
             .map_err(|err| WasmMiddlewareError::Worker(err.to_string()))?;
         drop(permit);
-
-        self.inner.invocations.fetch_add(1, Ordering::Relaxed);
-        match &result {
-            Ok(WasmAction::Continue) => {
-                self.inner.continues.fetch_add(1, Ordering::Relaxed);
-            }
-            Ok(WasmAction::Modify { .. }) => {
-                self.inner.modifies.fetch_add(1, Ordering::Relaxed);
-            }
-            Ok(WasmAction::Reject { .. }) => {
-                self.inner.rejects.fetch_add(1, Ordering::Relaxed);
-            }
-            Err(WasmMiddlewareError::Timeout(_)) => {
-                self.inner.timeouts.fetch_add(1, Ordering::Relaxed);
-            }
-            Err(WasmMiddlewareError::Trap(_)) => {
-                self.inner.traps.fetch_add(1, Ordering::Relaxed);
-            }
-            Err(_) => {}
-        }
         result
     }
 }
