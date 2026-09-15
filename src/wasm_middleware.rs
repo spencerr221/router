@@ -46,7 +46,7 @@ pub const DEFAULT_EXECUTION_DEADLINE: Duration = Duration::from_millis(100);
 pub const DEFAULT_ROUTE: &str = "/v1/chat/completions";
 const EPOCH_INTERVAL: Duration = Duration::from_millis(10);
 
-/// Headers plugins are never allowed to mutate.
+/// Headers plugins are never allowed to mutate on the outbound request.
 const IMMUTABLE_HEADERS: &[&str] = &[
     "authorization",
     "proxy-authorization",
@@ -64,6 +64,30 @@ const IMMUTABLE_HEADERS: &[&str] = &[
     "x-forwarded-host",
     "x-forwarded-proto",
     "forwarded",
+];
+
+/// Credential / session headers never copied into the guest envelope.
+/// v0.1 uses a denylist; a configurable allowlist can replace this later.
+const SENSITIVE_GUEST_HEADERS: &[&str] = &[
+    "authorization",
+    "proxy-authorization",
+    "cookie",
+    "cookie2",
+    "set-cookie",
+    "set-cookie2",
+];
+
+/// Paths where the WASM OnRequest layer is mounted (`protected_routes`).
+/// `--wasm-middleware-route` values outside this set are rejected at startup.
+pub const SUPPORTED_WASM_ROUTES: &[&str] = &[
+    "/generate",
+    "/inference/v1/generate",
+    "/v1/chat/completions",
+    "/v1/completions",
+    "/rerank",
+    "/v1/rerank",
+    "/v1/responses",
+    "/v1/embeddings",
 ];
 
 #[derive(Debug, Clone)]
@@ -140,6 +164,15 @@ impl WasmMiddlewareConfig {
             return Err(WasmMiddlewareError::InvalidConfig(
                 "wasm middleware requires at least one route".into(),
             ));
+        }
+        for route in &self.routes {
+            if !SUPPORTED_WASM_ROUTES.iter().any(|supported| *supported == route) {
+                return Err(WasmMiddlewareError::InvalidConfig(format!(
+                    "unsupported wasm middleware route `{route}`; \
+                     supported routes: {}",
+                    SUPPORTED_WASM_ROUTES.join(", ")
+                )));
+            }
         }
         if let Some(digest) = &self.sha256_hex {
             if digest.len() != 64 || !digest.chars().all(|c| c.is_ascii_hexdigit()) {
@@ -517,9 +550,14 @@ fn map_action(
     match action {
         WitAction::Continue => Ok(WasmAction::Continue),
         WitAction::Reject(status) => {
-            if status < 400 {
+            let Ok(code) = StatusCode::from_u16(status) else {
                 return Err(WasmMiddlewareError::InvalidAction(format!(
-                    "reject status must be >= 400, got {status}"
+                    "reject status must be a valid HTTP status code, got {status}"
+                )));
+            };
+            if !(code.is_client_error() || code.is_server_error()) {
+                return Err(WasmMiddlewareError::InvalidAction(format!(
+                    "reject status must be 4xx or 5xx, got {status}"
                 )));
             }
             Ok(WasmAction::Reject { status })
@@ -574,9 +612,10 @@ fn apply_header_mutations(
             warn!(header = %name, "ignoring wasm attempt to remove immutable header");
             continue;
         }
-        if let Ok(header_name) = HeaderName::from_bytes(name.as_bytes()) {
-            headers.remove(header_name);
-        }
+        let header_name = HeaderName::from_bytes(name.as_bytes()).map_err(|err| {
+            WasmMiddlewareError::InvalidAction(format!("invalid header name {name}: {err}"))
+        })?;
+        headers.remove(header_name);
     }
     for (name, value) in headers_set {
         if is_immutable_header(name) {
@@ -617,9 +656,16 @@ fn request_id_from_headers(headers: &http::HeaderMap) -> String {
     String::new()
 }
 
+fn is_sensitive_guest_header(name: &str) -> bool {
+    SENSITIVE_GUEST_HEADERS
+        .iter()
+        .any(|forbidden| name.eq_ignore_ascii_case(forbidden))
+}
+
 fn collect_wit_headers(headers: &http::HeaderMap) -> Vec<WitHeader> {
     headers
         .iter()
+        .filter(|(name, _)| !is_sensitive_guest_header(name.as_str()))
         .map(|(name, value)| WitHeader {
             name: name.as_str().to_string(),
             value: value.as_bytes().to_vec(),
@@ -647,18 +693,29 @@ pub async fn wasm_on_request_middleware(
 
     let method = request.method().as_str().to_string();
     let query = request.uri().query().unwrap_or_default().to_string();
-    let request_id = request_id_from_headers(request.headers());
+    let request_id = request
+        .extensions()
+        .get::<crate::middleware::RequestId>()
+        .map(|id| id.0.clone())
+        .filter(|id| !id.is_empty())
+        .unwrap_or_else(|| request_id_from_headers(request.headers()));
     let wit_headers = collect_wit_headers(request.headers());
 
     let (mut parts, body) = request.into_parts();
-    let bytes = match axum::body::to_bytes(body, state.max_payload_size).await {
+    // Bound the body read by the WASM input limit (and never above the server payload cap).
+    let input_limit = state
+        .runtime
+        .config()
+        .max_input_bytes
+        .min(state.max_payload_size);
+    let bytes = match axum::body::to_bytes(body, input_limit).await {
         Ok(bytes) => bytes,
         Err(err) => {
             let message = err.to_string();
             if message.contains("length limit exceeded") {
                 warn!(
                     "wasm middleware rejected oversized body (limit {} bytes)",
-                    state.max_payload_size
+                    input_limit
                 );
                 return StatusCode::PAYLOAD_TOO_LARGE.into_response();
             }
@@ -892,5 +949,51 @@ mod tests {
         let other_body = other.into_body().collect().await.unwrap().to_bytes();
         let other_json: Value = serde_json::from_slice(&other_body).unwrap();
         assert_eq!(other_json["x-wasm-middleware"], "");
+    }
+
+    #[test]
+    fn reject_status_must_be_valid_http_error() {
+        assert!(matches!(
+            map_action(WitAction::Reject(400), 1024),
+            Ok(WasmAction::Reject { status: 400 })
+        ));
+        assert!(matches!(
+            map_action(WitAction::Reject(200), 1024),
+            Err(WasmMiddlewareError::InvalidAction(_))
+        ));
+        assert!(matches!(
+            map_action(WitAction::Reject(65535), 1024),
+            Err(WasmMiddlewareError::InvalidAction(_))
+        ));
+    }
+
+    #[test]
+    fn headers_remove_invalid_name_fails_closed() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert("x-test", HeaderValue::from_static("1"));
+        let err = apply_header_mutations(&mut headers, &[], &[], &["bad name".into()])
+            .expect_err("invalid remove name");
+        assert!(matches!(err, WasmMiddlewareError::InvalidAction(_)));
+    }
+
+    #[test]
+    fn sensitive_headers_are_not_copied_to_guest() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(header::AUTHORIZATION, HeaderValue::from_static("secret"));
+        headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        let wit = collect_wit_headers(&headers);
+        assert!(wit.iter().any(|h| h.name.eq_ignore_ascii_case("content-type")));
+        assert!(!wit
+            .iter()
+            .any(|h| h.name.eq_ignore_ascii_case("authorization")));
+    }
+
+    #[test]
+    fn unsupported_route_fails_validation() {
+        let err = WasmMiddlewareConfig::from_path("/tmp/unused.component.wasm")
+            .with_routes(vec!["/health".into()])
+            .validate()
+            .expect_err("unsupported route");
+        assert!(matches!(err, WasmMiddlewareError::InvalidConfig(_)));
     }
 }

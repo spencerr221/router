@@ -12,6 +12,8 @@ on:
       - "py_test/integration/test_wasm_middleware.py"
       - "py_test/fixtures/router_manager.py"
       - "py_test/fixtures/mock_worker.py"
+      - "tests/test_wasm_middleware.rs"
+      - "tests/common/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - ".github/workflows/wasm-middleware.yml"
@@ -44,6 +46,9 @@ jobs:
       - name: Run WASM middleware unit tests
         run: cargo test --lib wasm_middleware:: -- --nocapture
 
+      - name: Run WASM middleware Rust integration tests
+        run: cargo test --test test_wasm_middleware -- --nocapture
+
       - name: Build router binary for integration tests
         run: cargo build --release --bin vllm-router
 
@@ -52,5 +57,5 @@ jobs:
           python3 -m pip install --upgrade pip
           python3 -m pip install pytest requests fastapi uvicorn
 
-      - name: Run WASM middleware integration test
+      - name: Run WASM middleware Python integration test
         run: python3 -m pytest py_test/integration/test_wasm_middleware.py -q
