@@ -165,7 +165,10 @@ impl WasmMiddlewareConfig {
             ));
         }
         for route in &self.routes {
-            if !SUPPORTED_WASM_ROUTES.iter().any(|supported| *supported == route) {
+            if !SUPPORTED_WASM_ROUTES
+                .iter()
+                .any(|supported| *supported == route)
+            {
                 return Err(WasmMiddlewareError::InvalidConfig(format!(
                     "unsupported wasm middleware route `{route}`; \
                      supported routes: {}",
@@ -911,12 +914,7 @@ mod tests {
         );
         let app = test_app(runtime, 1024 * 1024);
 
-        let chat = post_json(
-            app.clone(),
-            "/v1/chat/completions",
-            r#"{"messages":[]}"#,
-        )
-        .await;
+        let chat = post_json(app.clone(), "/v1/chat/completions", r#"{"messages":[]}"#).await;
         assert_eq!(chat.status(), StatusCode::OK);
         let chat_body = chat.into_body().collect().await.unwrap().to_bytes();
         let chat_json: Value = serde_json::from_slice(&chat_body).unwrap();
