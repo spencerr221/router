@@ -725,7 +725,7 @@ pub async fn wasm_on_request_middleware(
     }
 }
 
-/// Resolve the example component path for tests.
+/// Resolve the example component path for tests (if already built).
 pub fn example_component_artifact_path() -> Option<PathBuf> {
     let example_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/wasm_middleware");
     [
@@ -736,22 +736,74 @@ pub fn example_component_artifact_path() -> Option<PathBuf> {
     .find(|p| p.is_file())
 }
 
+/// Build the example guest via `examples/wasm_middleware/build.sh` once per process.
+///
+/// Tests should call this instead of requiring contributors to build the artifact
+/// manually before `cargo test`.
+pub fn ensure_example_component_artifact() -> Option<PathBuf> {
+    use std::sync::OnceLock;
+    static ARTIFACT: OnceLock<Option<PathBuf>> = OnceLock::new();
+    ARTIFACT
+        .get_or_init(|| {
+            let example_dir =
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/wasm_middleware");
+            let build_sh = example_dir.join("build.sh");
+            if !build_sh.is_file() {
+                eprintln!(
+                    "wasm middleware tests: missing build script at {}",
+                    build_sh.display()
+                );
+                return None;
+            }
+            let status = std::process::Command::new("bash")
+                .arg(&build_sh)
+                .current_dir(&example_dir)
+                .status();
+            match status {
+                Ok(code) if code.success() => example_component_artifact_path(),
+                Ok(code) => {
+                    eprintln!(
+                        "wasm middleware tests: build.sh exited with {code}; \
+                         install the wasm32-wasip2 target or check the example crate"
+                    );
+                    example_component_artifact_path()
+                }
+                Err(err) => {
+                    eprintln!("wasm middleware tests: failed to run build.sh: {err}");
+                    example_component_artifact_path()
+                }
+            }
+        })
+        .clone()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use axum::{body::Body, routing::post, Json, Router};
     use http_body_util::BodyExt;
     use serde_json::{json, Value};
+    use std::time::Instant;
     use tower::ServiceExt;
 
     fn require_component_path() -> PathBuf {
-        example_component_artifact_path().unwrap_or_else(|| {
+        ensure_example_component_artifact().unwrap_or_else(|| {
             panic!(
-                "WASM component artifact missing; run \
-                 `examples/wasm_middleware/build.sh` before \
-                 `cargo test --lib wasm_middleware::`"
+                "failed to build/find the example WASM component via \
+                 `examples/wasm_middleware/build.sh` (wasm32-wasip2 target required)"
             )
         })
+    }
+
+    fn wit_request(body: &[u8]) -> WitRequest {
+        WitRequest {
+            method: "POST".into(),
+            path: "/v1/chat/completions".into(),
+            query: String::new(),
+            headers: Vec::new(),
+            body: body.to_vec(),
+            request_id: "test".into(),
+        }
     }
 
     #[tokio::test]
@@ -760,14 +812,7 @@ mod tests {
         let runtime = WasmMiddlewareRuntime::load(WasmMiddlewareConfig::from_path(path))
             .expect("load wasm runtime");
         let action = runtime
-            .handle_request(WitRequest {
-                method: "POST".into(),
-                path: "/v1/chat/completions".into(),
-                query: String::new(),
-                headers: Vec::new(),
-                body: br#"{"messages":[]}"#.to_vec(),
-                request_id: "req-1".into(),
-            })
+            .handle_request(wit_request(br#"{"messages":[]}"#))
             .await
             .expect("invoke");
         match action {
@@ -789,14 +834,7 @@ mod tests {
         let runtime = WasmMiddlewareRuntime::load(WasmMiddlewareConfig::from_path(path))
             .expect("load wasm runtime");
         let action = runtime
-            .handle_request(WitRequest {
-                method: "POST".into(),
-                path: "/v1/chat/completions".into(),
-                query: String::new(),
-                headers: Vec::new(),
-                body: br#"{"note":"__wasm_reject__"}"#.to_vec(),
-                request_id: "req-2".into(),
-            })
+            .handle_request(wit_request(br#"{"note":"__wasm_reject__"}"#))
             .await
             .expect("invoke");
         assert_eq!(action, WasmAction::Reject { status: 400 });
@@ -824,14 +862,7 @@ mod tests {
         let runtime = WasmMiddlewareRuntime::load(config).expect("load");
         let err = tokio::runtime::Runtime::new()
             .unwrap()
-            .block_on(runtime.handle_request(WitRequest {
-                method: "POST".into(),
-                path: "/v1/chat/completions".into(),
-                query: String::new(),
-                headers: Vec::new(),
-                body: b"0123456789".to_vec(),
-                request_id: String::new(),
-            }))
+            .block_on(runtime.handle_request(wit_request(b"0123456789")))
             .expect_err("too large");
         assert!(matches!(err, WasmMiddlewareError::InputTooLarge { .. }));
     }
@@ -846,55 +877,193 @@ mod tests {
         Json(json!({ "x-wasm-middleware": marker }))
     }
 
+    fn test_app(runtime: Arc<WasmMiddlewareRuntime>, max_payload_size: usize) -> Router {
+        Router::new()
+            .route("/v1/chat/completions", post(echo_headers))
+            .route("/v1/completions", post(echo_headers))
+            .layer(axum::middleware::from_fn_with_state(
+                WasmRouteMiddlewareState {
+                    runtime,
+                    max_payload_size,
+                },
+                wasm_on_request_middleware,
+            ))
+    }
+
+    async fn post_json(app: Router, uri: &str, body: &str) -> Response {
+        app.oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+    }
+
     #[tokio::test]
     async fn axum_layer_applies_on_configured_route() {
         let path = require_component_path();
         let runtime = Arc::new(
             WasmMiddlewareRuntime::load(WasmMiddlewareConfig::from_path(path)).expect("load"),
         );
-        let app = Router::new()
-            .route("/v1/chat/completions", post(echo_headers))
-            .route("/v1/completions", post(echo_headers))
-            .layer(axum::middleware::from_fn_with_state(
-                WasmRouteMiddlewareState {
-                    runtime,
-                    max_payload_size: 1024 * 1024,
-                },
-                wasm_on_request_middleware,
-            ));
+        let app = test_app(runtime, 1024 * 1024);
 
-        let chat = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/v1/chat/completions")
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(r#"{"messages":[]}"#))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+        let chat = post_json(
+            app.clone(),
+            "/v1/chat/completions",
+            r#"{"messages":[]}"#,
+        )
+        .await;
         assert_eq!(chat.status(), StatusCode::OK);
         let chat_body = chat.into_body().collect().await.unwrap().to_bytes();
         let chat_json: Value = serde_json::from_slice(&chat_body).unwrap();
         assert_eq!(chat_json["x-wasm-middleware"], "example");
 
-        let other = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/v1/completions")
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(r#"{"prompt":"hi"}"#))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+        let other = post_json(app, "/v1/completions", r#"{"prompt":"hi"}"#).await;
         assert_eq!(other.status(), StatusCode::OK);
         let other_body = other.into_body().collect().await.unwrap().to_bytes();
         let other_json: Value = serde_json::from_slice(&other_body).unwrap();
         assert_eq!(other_json["x-wasm-middleware"], "");
+    }
+
+    #[tokio::test]
+    async fn concurrent_requests_are_handled() {
+        let path = require_component_path();
+        let mut config = WasmMiddlewareConfig::from_path(path);
+        config.worker_count = 4;
+        config.queue_capacity = 64;
+        let runtime = Arc::new(WasmMiddlewareRuntime::load(config).expect("load"));
+
+        let mut tasks = Vec::new();
+        for i in 0..32 {
+            let runtime = runtime.clone();
+            tasks.push(tokio::spawn(async move {
+                let body = format!(r#"{{"messages":[],"n":{i}}}"#);
+                runtime.handle_request(wit_request(body.as_bytes())).await
+            }));
+        }
+
+        for task in tasks {
+            let action = task.await.expect("join").expect("invoke");
+            match action {
+                WasmAction::Modify { headers_set, .. } => {
+                    assert!(headers_set.iter().any(|(name, value)| {
+                        name.eq_ignore_ascii_case("x-wasm-middleware") && value == b"example"
+                    }));
+                }
+                other => panic!("expected Modify, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn infinite_loop_plugin_times_out_without_blocking_later_requests() {
+        let path = require_component_path();
+        let mut config = WasmMiddlewareConfig::from_path(path);
+        config.execution_deadline = Duration::from_millis(100);
+        config.worker_count = 1;
+        config.queue_capacity = 2;
+        let runtime = WasmMiddlewareRuntime::load(config).expect("load");
+
+        let started = Instant::now();
+        let err = runtime
+            .handle_request(wit_request(br#"{"note":"__wasm_loop__"}"#))
+            .await
+            .expect_err("loop should hit the execution deadline");
+        // Epoch interruption may surface as Timeout or a generic Trap depending on Wasmtime.
+        assert!(
+            matches!(
+                err,
+                WasmMiddlewareError::Timeout(_) | WasmMiddlewareError::Trap(_)
+            ),
+            "expected Timeout or Trap, got {err}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "epoch timeout took too long: {:?}",
+            started.elapsed()
+        );
+
+        // WASM worker must still accept subsequent requests after the trap/timeout.
+        let action = runtime
+            .handle_request(wit_request(br#"{"messages":[]}"#))
+            .await
+            .expect("follow-up invoke");
+        match action {
+            WasmAction::Modify { headers_set, .. } => {
+                assert!(headers_set.iter().any(|(name, value)| {
+                    name.eq_ignore_ascii_case("x-wasm-middleware") && value == b"example"
+                }));
+            }
+            other => panic!("expected Modify after timeout recovery, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn middleware_maps_each_response_status_code() {
+        let path = require_component_path();
+
+        // Reject statuses returned by the guest.
+        for status in [400_u16, 401, 403, 404, 429, 500, 503] {
+            let runtime = Arc::new(
+                WasmMiddlewareRuntime::load(WasmMiddlewareConfig::from_path(&path)).expect("load"),
+            );
+            let app = test_app(runtime, 1024 * 1024);
+            let body = format!(r#"{{"note":"__wasm_reject_{status}__"}}"#);
+            let response = post_json(app, "/v1/chat/completions", &body).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::from_u16(status).unwrap(),
+                "reject marker should map to HTTP {status}"
+            );
+        }
+
+        // Input too large → 413
+        {
+            let mut config = WasmMiddlewareConfig::from_path(&path);
+            config.max_input_bytes = 32;
+            let runtime = Arc::new(WasmMiddlewareRuntime::load(config).expect("load"));
+            let app = test_app(runtime, 1024 * 1024);
+            let oversized = format!(r#"{{"pad":"{}"}}"#, "x".repeat(64));
+            let response = post_json(app, "/v1/chat/completions", &oversized).await;
+            assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        }
+
+        // Execution timeout / trap → 500
+        {
+            let mut config = WasmMiddlewareConfig::from_path(&path);
+            config.execution_deadline = Duration::from_millis(100);
+            let runtime = Arc::new(WasmMiddlewareRuntime::load(config).expect("load"));
+            let app = test_app(runtime, 1024 * 1024);
+            let response =
+                post_json(app, "/v1/chat/completions", r#"{"note":"__wasm_loop__"}"#).await;
+            assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        }
+
+        // Saturated queue → 503
+        {
+            let mut config = WasmMiddlewareConfig::from_path(&path);
+            config.worker_count = 1;
+            config.queue_capacity = 1;
+            config.execution_deadline = Duration::from_millis(400);
+            let runtime = Arc::new(WasmMiddlewareRuntime::load(config).expect("load"));
+            let app = test_app(runtime, 1024 * 1024);
+
+            let busy = tokio::spawn(post_json(
+                app.clone(),
+                "/v1/chat/completions",
+                r#"{"note":"__wasm_loop__"}"#,
+            ));
+            // Let the looping request take the only queue/worker slot.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let rejected = post_json(app, "/v1/chat/completions", r#"{"messages":[]}"#).await;
+            assert_eq!(rejected.status(), StatusCode::SERVICE_UNAVAILABLE);
+            let busy_status = busy.await.expect("join").status();
+            assert_eq!(busy_status, StatusCode::INTERNAL_SERVER_ERROR);
+        }
     }
 
     #[test]
@@ -926,9 +1095,14 @@ mod tests {
     fn sensitive_headers_are_not_copied_to_guest() {
         let mut headers = http::HeaderMap::new();
         headers.insert(header::AUTHORIZATION, HeaderValue::from_static("secret"));
-        headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
         let wit = collect_wit_headers(&headers);
-        assert!(wit.iter().any(|h| h.name.eq_ignore_ascii_case("content-type")));
+        assert!(wit
+            .iter()
+            .any(|h| h.name.eq_ignore_ascii_case("content-type")));
         assert!(!wit
             .iter()
             .any(|h| h.name.eq_ignore_ascii_case("authorization")));

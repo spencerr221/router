@@ -13,7 +13,9 @@ Produces `wasm_middleware_example.component.wasm` in this directory.
 
 ## Behavior
 
-- `Reject(400)` when the request body contains `__wasm_reject__`
+- `Reject(N)` when the body contains `__wasm_reject_N__` (e.g. `__wasm_reject_403__`)
+- `Reject(400)` when the body contains `__wasm_reject__`
+- Infinite loop when the body contains `__wasm_loop__` (for host timeout tests only)
 - Otherwise `Modify` with header `x-wasm-middleware: example` (body unchanged)
 
 ## Run with Router

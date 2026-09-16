@@ -1,7 +1,6 @@
 //! Integration tests for WASM OnRequest middleware with mock HTTP workers.
 //!
-//! Requires the example component artifact:
-//! `bash examples/wasm_middleware/build.sh`
+//! Builds the example component via `examples/wasm_middleware/build.sh` on demand.
 
 mod common;
 
@@ -10,9 +9,7 @@ use axum::{
     extract::Request,
     http::{header::CONTENT_TYPE, StatusCode},
 };
-use common::mock_worker::{
-    self, HealthStatus, MockWorker, MockWorkerConfig, WorkerType,
-};
+use common::mock_worker::{self, HealthStatus, MockWorker, MockWorkerConfig, WorkerType};
 use common::test_app::create_test_app_with_wasm;
 use http_body_util::BodyExt;
 use reqwest::Client;
@@ -23,15 +20,14 @@ use tower::ServiceExt;
 use vllm_router_rs::config::{RouterConfig, RoutingMode};
 use vllm_router_rs::routers::RouterFactory;
 use vllm_router_rs::wasm_middleware::{
-    example_component_artifact_path, WasmMiddlewareConfig, WasmMiddlewareRuntime,
+    ensure_example_component_artifact, WasmMiddlewareConfig, WasmMiddlewareRuntime,
 };
 
 fn require_component_path() -> PathBuf {
-    example_component_artifact_path().unwrap_or_else(|| {
+    ensure_example_component_artifact().unwrap_or_else(|| {
         panic!(
-            "WASM component artifact missing; run \
-             `examples/wasm_middleware/build.sh` before \
-             `cargo test --test test_wasm_middleware`"
+            "failed to build/find the example WASM component via \
+             `examples/wasm_middleware/build.sh` (wasm32-wasip2 target required)"
         )
     })
 }
