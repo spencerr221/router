@@ -52,6 +52,13 @@ impl ConfigValidator {
                 reason: "reasoning_token_balance requires token_capacity_per_dp_rank".to_string(),
             });
         }
+        if config.prediction_profile.mode == PredictionMode::Active
+            && config.token_capacity_per_dp_rank.is_none()
+        {
+            return Err(ConfigError::ValidationFailed {
+                reason: "active prediction requires token_capacity_per_dp_rank".to_string(),
+            });
+        }
         let positive_finite = [
             ("metrics_interval_seconds", config.metrics_interval_seconds),
             ("queue_timeout_seconds", config.queue_timeout_seconds),
@@ -902,6 +909,19 @@ mod tests {
         for config in invalid {
             assert!(ConfigValidator::validate_program_scheduling(&config).is_err());
         }
+    }
+
+    #[test]
+    fn active_prediction_requires_token_capacity() {
+        let mut config = ProgramSchedulingConfig::default();
+        config.prediction_profile.mode = PredictionMode::Active;
+        let error = ConfigValidator::validate_program_scheduling(&config)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("active prediction requires token_capacity_per_dp_rank"));
+
+        config.token_capacity_per_dp_rank = Some(1_000);
+        assert!(ConfigValidator::validate_program_scheduling(&config).is_ok());
     }
 
     #[test]

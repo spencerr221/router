@@ -4,7 +4,7 @@
 //! They are decision facts, not an additional Program lifecycle state machine.
 
 use super::lineage::ProgramLineage;
-use super::output_length::PendingOutputPrediction;
+use super::output_length::{OutputReservationSource, PendingOutputPrediction};
 use super::prediction_profile::PredictionProfileStore;
 use super::return_time::PendingReturnPrediction;
 use super::{
@@ -169,6 +169,7 @@ pub(crate) struct ProgramDecisionState {
     pub(crate) last_target: Option<String>,
     pub(crate) estimated_context_tokens: usize,
     pub(crate) output_token_reservation: Option<usize>,
+    pub(crate) output_token_reservation_source: Option<OutputReservationSource>,
     pub(crate) context_shrink_observations: u8,
     pub(crate) completed_requests: usize,
     pub(crate) segment_served_rounds: usize,
@@ -229,6 +230,7 @@ impl ProgramDecisionState {
             home_target,
             estimated_context_tokens,
             output_token_reservation: None,
+            output_token_reservation_source: None,
             context_shrink_observations: 0,
             completed_requests: 0,
             segment_served_rounds: 0,
@@ -268,18 +270,26 @@ impl ProgramDecisionState {
         self.private_tokens_with_output(decode_buffer_tokens, None)
     }
 
+    pub(crate) fn private_context_tokens(&self) -> usize {
+        self.estimated_context_tokens
+            .saturating_sub(self.shared_prefix_tokens)
+    }
+
+    pub(crate) fn effective_output_reservation(&self, decode_buffer_tokens: usize) -> usize {
+        self.output_token_reservation
+            .unwrap_or(decode_buffer_tokens)
+    }
+
     pub(crate) fn private_tokens_with_output(
         &self,
         decode_buffer_tokens: usize,
         expected_output_tokens: Option<usize>,
     ) -> f64 {
-        self.estimated_context_tokens
-            .saturating_sub(self.shared_prefix_tokens)
-            .saturating_add(
-                expected_output_tokens
-                    .or(self.output_token_reservation)
-                    .unwrap_or(decode_buffer_tokens),
-            ) as f64
+        self.private_context_tokens().saturating_add(
+            expected_output_tokens
+                .or(self.output_token_reservation)
+                .unwrap_or(decode_buffer_tokens),
+        ) as f64
     }
 
     pub(crate) fn observe_completed_context(&mut self, observed_context_tokens: usize) {
