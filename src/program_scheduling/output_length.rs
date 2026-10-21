@@ -1,7 +1,55 @@
-//! Current-request output-length shadow prediction.
+//! Current-request output-length prediction and capacity reservation.
+
+use crate::config::types::PredictionMode;
 
 use super::prediction_profile::{OutputLengthKey, OutputPrediction};
 use super::ProgramIdentity;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OutputReservationSource {
+    Explicit,
+    Prediction,
+}
+
+impl OutputReservationSource {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Explicit => "explicit",
+            Self::Prediction => "prediction",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OutputReservation {
+    pub tokens: Option<usize>,
+    pub source: Option<OutputReservationSource>,
+}
+
+pub(crate) fn resolve_reservation(
+    mode: PredictionMode,
+    explicit_tokens: Option<usize>,
+    prediction: Option<&OutputPrediction>,
+) -> OutputReservation {
+    if let Some(tokens) = explicit_tokens {
+        return OutputReservation {
+            tokens: Some(tokens),
+            source: Some(OutputReservationSource::Explicit),
+        };
+    }
+    if mode == PredictionMode::Active {
+        if let Some(prediction) = prediction.filter(|prediction| prediction.mature) {
+            return OutputReservation {
+                tokens: Some(prediction.tokens),
+                source: Some(OutputReservationSource::Prediction),
+            };
+        }
+    }
+    OutputReservation {
+        tokens: None,
+        source: None,
+    }
+}
 
 pub(crate) fn keys_for_request(identity: &ProgramIdentity) -> Vec<OutputLengthKey> {
     let profile_role = identity.spawn_reason().or_else(|| identity.agent_role());
@@ -57,6 +105,7 @@ pub(crate) struct PendingOutputPrediction {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::program_scheduling::prediction_profile::PredictionSource;
     use serde_json::json;
 
     fn identity(agent_role: &str, spawn_reason: Option<&str>) -> ProgramIdentity {
@@ -95,5 +144,63 @@ mod tests {
         let keys = keys_for_request(&identity("subagent", None));
 
         assert_eq!(keys[0].profile_role.as_deref(), Some("subagent"));
+    }
+
+    fn prediction(tokens: usize, mature: bool) -> OutputPrediction {
+        OutputPrediction {
+            tokens,
+            p50: tokens,
+            p95: tokens,
+            p99: tokens,
+            support: 100,
+            online_support: 0,
+            backoff_level: 0,
+            source: PredictionSource::Offline,
+            mature,
+        }
+    }
+
+    #[test]
+    fn active_reservation_prefers_explicit_then_mature_prediction() {
+        let predicted = prediction(512, true);
+        assert_eq!(
+            resolve_reservation(PredictionMode::Active, Some(256), Some(&predicted)),
+            OutputReservation {
+                tokens: Some(256),
+                source: Some(OutputReservationSource::Explicit),
+            }
+        );
+        assert_eq!(
+            resolve_reservation(PredictionMode::Active, None, Some(&predicted)),
+            OutputReservation {
+                tokens: Some(512),
+                source: Some(OutputReservationSource::Prediction),
+            }
+        );
+        let short = prediction(64, true);
+        assert_eq!(
+            resolve_reservation(PredictionMode::Active, None, Some(&short)).tokens,
+            Some(64)
+        );
+    }
+
+    #[test]
+    fn shadow_and_immature_active_predictions_use_the_default_fallback() {
+        let mature = prediction(512, true);
+        let immature = prediction(512, false);
+        assert_eq!(
+            resolve_reservation(PredictionMode::Shadow, None, Some(&mature)),
+            OutputReservation {
+                tokens: None,
+                source: None,
+            }
+        );
+        assert_eq!(
+            resolve_reservation(PredictionMode::Active, None, Some(&immature)),
+            OutputReservation {
+                tokens: None,
+                source: None,
+            }
+        );
     }
 }

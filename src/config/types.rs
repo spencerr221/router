@@ -128,9 +128,11 @@ pub enum PredictionMode {
     /// Collect and evaluate predictions without changing scheduling decisions.
     #[default]
     Shadow,
+    /// Use mature output-length predictions for request capacity reservation.
+    Active,
 }
 
-/// Shared configuration for workflow-profile shadow predictors.
+/// Shared configuration for workflow-profile predictors.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PredictionProfileConfig {
     #[serde(default)]
@@ -245,7 +247,7 @@ pub struct ProgramSchedulingConfig {
     pub stats_window_size: usize,
     #[serde(default = "default_program_enable_batch_gain_admission")]
     pub enable_batch_gain_admission: bool,
-    /// Offline-seeded, online-updated workflow prediction in off/shadow mode.
+    /// Offline-seeded, online-updated workflow prediction.
     #[serde(default)]
     pub prediction_profile: PredictionProfileConfig,
     /// Offline-calibrated cold-prefill cost and mixed-batch decode impact.
@@ -1251,6 +1253,13 @@ mod tests {
         let serialized = serde_json::to_value(legacy).unwrap();
         assert_eq!(serialized["token_capacity_per_dp_rank"], 456);
         assert!(serialized.get("token_capacity_per_target").is_none());
+    }
+
+    #[test]
+    fn program_scheduling_accepts_active_prediction_mode() {
+        let config: ProgramSchedulingConfig =
+            serde_json::from_str(r#"{"prediction_profile":{"mode":"active"}}"#).unwrap();
+        assert_eq!(config.prediction_profile.mode, PredictionMode::Active);
     }
 
     #[test]
