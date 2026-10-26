@@ -207,12 +207,13 @@ impl ConfigValidator {
             || prediction.return_time_horizon_seconds <= 0.0
             || !prediction.output_length_quantile.is_finite()
             || !(0.0..1.0).contains(&prediction.output_length_quantile)
+            || !prediction.output_reservation_factor.is_finite()
+            || !(0.0..=1.0).contains(&prediction.output_reservation_factor)
             || !prediction.stability_tolerance.is_finite()
             || prediction.stability_tolerance < 0.0
         {
             return Err(ConfigError::ValidationFailed {
-                reason: "Prediction horizons, quantiles, and stability tolerance are invalid"
-                    .to_string(),
+                reason: "Prediction horizons, quantiles, reservation factors, and stability tolerance are invalid".to_string(),
             });
         }
         if !strictly_increasing_f64(&prediction.return_time_bucket_bounds_seconds)
@@ -921,6 +922,19 @@ mod tests {
         assert!(error.contains("active prediction requires token_capacity_per_dp_rank"));
 
         config.token_capacity_per_dp_rank = Some(1_000);
+        assert!(ConfigValidator::validate_program_scheduling(&config).is_ok());
+    }
+
+    #[test]
+    fn output_reservation_factor_must_be_between_zero_and_one() {
+        let mut config = ProgramSchedulingConfig::default();
+        config.prediction_profile.output_reservation_factor = -0.01;
+        assert!(ConfigValidator::validate_program_scheduling(&config).is_err());
+
+        config.prediction_profile.output_reservation_factor = 1.01;
+        assert!(ConfigValidator::validate_program_scheduling(&config).is_err());
+
+        config.prediction_profile.output_reservation_factor = 0.5;
         assert!(ConfigValidator::validate_program_scheduling(&config).is_ok());
     }
 

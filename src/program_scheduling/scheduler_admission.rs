@@ -185,6 +185,10 @@ impl ProgramScheduler {
                 pending_output_prediction
                     .as_ref()
                     .and_then(|pending| pending.prediction.as_ref()),
+            )
+            .with_factor(
+                self.config.progress_ttl.decode_buffer_tokens,
+                self.config.prediction_profile.output_reservation_factor,
             );
             self.ensure_decision_state_with_reservation(
                 &mut state,
@@ -638,14 +642,8 @@ impl ProgramScheduler {
             .collect::<Vec<_>>();
         let used_tokens = self.target_usage(state, target_id, now);
         let active_count = active.len();
-        let expected_output_tokens = state
-            .runtime
-            .front_request_hints(program)
-            .and_then(|hints| hints.expected_output_tokens);
-        let required_tokens = decision.private_tokens_with_output(
-            self.config.progress_ttl.decode_buffer_tokens,
-            expected_output_tokens,
-        );
+        let required_tokens =
+            decision.private_tokens(self.config.progress_ttl.decode_buffer_tokens);
         let capacity = self.config.progress_ttl.token_capacity;
         let count_fits =
             |count: usize| count.saturating_add(1) <= self.config.max_active_programs_per_target;
@@ -1151,6 +1149,7 @@ mod tests {
         let mut config = ProgramSchedulerConfig::default();
         config.progress_ttl.token_capacity = Some(1_000);
         config.prediction_profile.mode = PredictionMode::Active;
+        config.prediction_profile.output_reservation_factor = 0.5;
         config.prediction_profile.output_length_quantile = 0.5;
         config.prediction_profile.output_length_min_support = 1;
         config.prediction_profile.output_length_tail_samples = 1;
@@ -1175,7 +1174,7 @@ mod tests {
 
         let dispatch = scheduler
             .acquire(
-                identity_with_expected_output("explicit-output", 64),
+                identity_with_expected_output("explicit-output", 600),
                 100,
                 &[target()],
                 None,
@@ -1184,14 +1183,14 @@ mod tests {
             .unwrap();
         let state = scheduler.state.lock();
         let decision = &state.decisions[dispatch.program()];
-        assert_eq!(decision.output_token_reservation, Some(64));
+        assert_eq!(decision.output_token_reservation, Some(350));
         assert_eq!(
             decision.output_token_reservation_source,
             Some(output_length::OutputReservationSource::Explicit)
         );
         assert_eq!(
             decision.private_tokens(scheduler.config.progress_ttl.decode_buffer_tokens),
-            164.0
+            450.0
         );
     }
 
@@ -1415,6 +1414,33 @@ mod tests {
             .rank_admission_plan(&state, handle.program(), "rank-0", now)
             .unwrap();
         assert_eq!(plan.required_tokens, 300.0);
+    }
+
+    #[test]
+    fn scaled_output_reservation_controls_admission_required_tokens() {
+        let mut config = ProgramSchedulerConfig::default();
+        config.progress_ttl.token_capacity = Some(1_000);
+        config.progress_ttl.low_watermark_ratio = 1.0;
+        let scheduler = ProgramScheduler::new(config);
+        scheduler.sync_targets("model", &[target()]);
+        let now = Instant::now();
+        let identity = identity_with_expected_output("program", 600);
+        let mut state = scheduler.state.lock();
+        let handle = state.runtime.retain_request(&identity, 100, None, now);
+        scheduler.ensure_decision_state_with_reservation(
+            &mut state,
+            &identity,
+            handle.program().clone(),
+            100,
+            Some(350),
+            Some(output_length::OutputReservationSource::Explicit),
+            now,
+            None,
+        );
+        let plan = scheduler
+            .rank_admission_plan(&state, handle.program(), "rank-0", now)
+            .unwrap();
+        assert_eq!(plan.required_tokens, 450.0);
     }
 
     #[test]

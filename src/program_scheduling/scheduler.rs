@@ -359,12 +359,6 @@ impl ProgramScheduler {
                     if let Some(private_tokens) = private_tokens {
                         checkpoint.active_reasoning_private_tokens += private_tokens;
                     }
-                    if let Some(decision) = state.decisions.get(program.reference) {
-                        checkpoint.active_reasoning_output_reservation_tokens +=
-                            decision.effective_output_reservation(
-                                self.config.progress_ttl.decode_buffer_tokens,
-                            ) as f64;
-                    }
                 }
                 ProgramStatus::Acting => {
                     if let Some(private_tokens) = private_tokens {
@@ -410,9 +404,10 @@ impl ProgramScheduler {
             let estimated_reasoning_tokens = native_used_tokens.map(|native_used| {
                 let running = raw.running_requests.unwrap_or(0);
                 if running > 0 {
-                    native_used * checkpoint.active_reasoning_programs.max(running) as f64
-                        / running as f64
-                        + checkpoint.active_reasoning_output_reservation_tokens
+                    let observed_running_tokens = native_used
+                        * checkpoint.active_reasoning_programs.max(running) as f64
+                        / running as f64;
+                    observed_running_tokens.max(checkpoint.active_reasoning_private_tokens)
                 } else if checkpoint.active_reasoning_programs > 0 {
                     checkpoint.active_reasoning_private_tokens
                 } else {
@@ -788,7 +783,6 @@ struct ObservationCheckpoint {
     active_reasoning_programs: usize,
     active_reasoning_requests: usize,
     active_reasoning_private_tokens: f64,
-    active_reasoning_output_reservation_tokens: f64,
     active_acting_private_tokens: f64,
 }
 
@@ -835,7 +829,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn backend_observation_preserves_active_output_reservation() {
+    async fn backend_observation_uses_max_of_native_and_projected_request_tokens() {
         use crate::config::types::PredictionMode;
         use crate::program_scheduling::prediction_profile::OutputLengthKey;
 
@@ -889,7 +883,7 @@ mod tests {
                 target_id: target.id.clone(),
                 base_url: target.base_url.clone(),
                 dp_rank: target.dp_rank,
-                kv_cache_usage: Some(0.1),
+                kv_cache_usage: Some(0.3),
                 running_requests: Some(1),
                 waiting_requests: Some(0),
                 observed_at: Instant::now(),
@@ -900,6 +894,27 @@ mod tests {
         assert_eq!(
             scheduler.target_usage(&state, "rank-0", Instant::now()),
             356.0
+        );
+        drop(state);
+
+        let epoch = scheduler.begin_observation(std::slice::from_ref(&target));
+        scheduler.apply_observations(
+            epoch,
+            [BackendObservation {
+                target_id: target.id.clone(),
+                base_url: target.base_url.clone(),
+                dp_rank: target.dp_rank,
+                kv_cache_usage: Some(0.4),
+                running_requests: Some(1),
+                waiting_requests: Some(0),
+                observed_at: Instant::now(),
+            }],
+        );
+
+        let state = scheduler.state.lock();
+        assert_eq!(
+            scheduler.target_usage(&state, "rank-0", Instant::now()),
+            400.0
         );
     }
 

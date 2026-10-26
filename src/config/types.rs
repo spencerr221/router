@@ -161,6 +161,10 @@ pub struct PredictionProfileConfig {
     pub output_length_bucket_bounds_tokens: Vec<usize>,
     #[serde(default = "default_output_length_quantile")]
     pub output_length_quantile: f64,
+    /// Fraction of the predicted output above `decode_buffer_tokens` reserved
+    /// for admission. The decode buffer remains the minimum reservation.
+    #[serde(default = "default_output_reservation_factor")]
+    pub output_reservation_factor: f64,
     #[serde(default = "default_output_length_min_support")]
     pub output_length_min_support: usize,
     #[serde(default = "default_output_length_tail_samples")]
@@ -186,6 +190,7 @@ impl Default for PredictionProfileConfig {
             step_bucket_size: default_prediction_step_bucket_size(),
             output_length_bucket_bounds_tokens: default_output_length_bucket_bounds_tokens(),
             output_length_quantile: default_output_length_quantile(),
+            output_reservation_factor: default_output_reservation_factor(),
             output_length_min_support: default_output_length_min_support(),
             output_length_tail_samples: default_output_length_tail_samples(),
             stability_window_size: default_prediction_stability_window_size(),
@@ -648,6 +653,10 @@ fn default_output_length_bucket_bounds_tokens() -> Vec<usize> {
 
 fn default_output_length_quantile() -> f64 {
     0.95
+}
+
+fn default_output_reservation_factor() -> f64 {
+    1.0
 }
 
 fn default_output_length_min_support() -> usize {
@@ -1260,6 +1269,13 @@ mod tests {
         let config: ProgramSchedulingConfig =
             serde_json::from_str(r#"{"prediction_profile":{"mode":"active"}}"#).unwrap();
         assert_eq!(config.prediction_profile.mode, PredictionMode::Active);
+        assert_eq!(config.prediction_profile.output_reservation_factor, 1.0);
+
+        let scaled: ProgramSchedulingConfig = serde_json::from_str(
+            r#"{"prediction_profile":{"mode":"active","output_reservation_factor":0.5}}"#,
+        )
+        .unwrap();
+        assert_eq!(scaled.prediction_profile.output_reservation_factor, 0.5);
     }
 
     #[test]

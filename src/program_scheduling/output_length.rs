@@ -26,6 +26,18 @@ pub(crate) struct OutputReservation {
     pub source: Option<OutputReservationSource>,
 }
 
+impl OutputReservation {
+    pub(crate) fn with_factor(self, minimum_tokens: usize, factor: f64) -> Self {
+        Self {
+            tokens: self.tokens.map(|tokens| {
+                let additional = tokens.saturating_sub(minimum_tokens);
+                minimum_tokens.saturating_add((additional as f64 * factor).ceil() as usize)
+            }),
+            source: self.source,
+        }
+    }
+}
+
 pub(crate) fn resolve_reservation(
     mode: PredictionMode,
     explicit_tokens: Option<usize>,
@@ -201,6 +213,28 @@ mod tests {
                 tokens: None,
                 source: None,
             }
+        );
+    }
+
+    #[test]
+    fn reservation_factor_preserves_the_decode_buffer_floor() {
+        let reservation = OutputReservation {
+            tokens: Some(6_000),
+            source: Some(OutputReservationSource::Explicit),
+        };
+        assert_eq!(reservation.with_factor(100, 0.0).tokens, Some(100));
+        assert_eq!(reservation.with_factor(100, 0.25).tokens, Some(1_575));
+        assert_eq!(reservation.with_factor(100, 0.5).tokens, Some(3_050));
+        assert_eq!(reservation.with_factor(100, 0.75).tokens, Some(4_525));
+        assert_eq!(reservation.with_factor(100, 1.0).tokens, Some(6_000));
+        assert_eq!(
+            OutputReservation {
+                tokens: Some(64),
+                source: Some(OutputReservationSource::Explicit),
+            }
+            .with_factor(100, 0.5)
+            .tokens,
+            Some(100)
         );
     }
 }
