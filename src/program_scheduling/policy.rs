@@ -110,6 +110,8 @@ pub struct BatchGainInputs<'a> {
     pub used_tokens: f64,
     /// Candidate private tokens required immediately.
     pub required_tokens: f64,
+    /// Candidate growth protected by the bypassable reserve.
+    pub candidate_growth_reserve_tokens: f64,
     /// Remaining protected rounds for every active Program except the candidate.
     pub protected_remaining_rounds: &'a [f64],
     /// Cache-miss impact for each corresponding protected Program.
@@ -242,17 +244,26 @@ impl ProgressTtlPolicyMath {
     }
 
     /// Growth reserve for the candidate plus remaining active Program rounds.
+    ///
+    /// A request-specific prediction replaces the candidate's rolling-average
+    /// growth estimate. Active Programs continue to use the mature rank-local
+    /// rolling estimate.
     pub fn continuous_growth_reserve_tokens(
         &self,
         factors: &ProgressTtlFactors,
+        candidate_growth_reserve_tokens: Option<f64>,
         active_remaining_rounds: impl Iterator<Item = f64>,
     ) -> f64 {
         let target_rounds = self.target_rounds(factors);
         let growth = factors.average_context_growth_tokens();
-        if target_rounds <= 0.0 || growth <= 0.0 {
-            return 0.0;
-        }
-        growth * (target_rounds + active_remaining_rounds.sum::<f64>())
+        let candidate = candidate_growth_reserve_tokens
+            .unwrap_or_else(|| growth.max(0.0) * target_rounds.max(0.0));
+        let active = if target_rounds <= 0.0 || growth <= 0.0 {
+            0.0
+        } else {
+            growth * active_remaining_rounds.sum::<f64>()
+        };
+        candidate + active
     }
 
     /// Predicted aggregate output throughput for one decode batch.
@@ -312,7 +323,7 @@ impl ProgressTtlPolicyMath {
                 (capacity as f64 * self.config.low_watermark_ratio - input.used_tokens).max(0.0);
             let before = total_protected_rounds.min(remaining / growth);
             let after = total_protected_rounds.min(
-                (remaining - input.required_tokens - growth * self.target_rounds(input.factors))
+                (remaining - input.required_tokens - input.candidate_growth_reserve_tokens)
                     .max(0.0)
                     / growth,
             );
@@ -394,7 +405,7 @@ mod tests {
         assert_eq!(policy.fitted_acting_ttl(&factors, 6.0), Duration::ZERO);
         assert_eq!(policy.target_rounds(&factors), 0.0);
         assert_eq!(
-            policy.continuous_growth_reserve_tokens(&factors, [3.0].into_iter()),
+            policy.continuous_growth_reserve_tokens(&factors, None, [3.0].into_iter()),
             0.0
         );
     }
@@ -409,8 +420,25 @@ mod tests {
         let factors = mature_factors(1.0);
         assert_eq!(policy.target_rounds(&factors), 6.0);
         assert_eq!(
-            policy.continuous_growth_reserve_tokens(&factors, [2.0, 1.0].into_iter()),
+            policy.continuous_growth_reserve_tokens(&factors, None, [2.0, 1.0].into_iter()),
             9_000.0
+        );
+        assert_eq!(
+            policy.continuous_growth_reserve_tokens(&factors, Some(500.0), [2.0, 1.0].into_iter(),),
+            3_500.0
+        );
+    }
+
+    #[test]
+    fn predicted_candidate_growth_is_available_before_rank_window_matures() {
+        let policy = ProgressTtlPolicyMath::new(ProgressTtlConfig {
+            stats_window_size: 2,
+            ..ProgressTtlConfig::default()
+        });
+        let factors = ProgressTtlFactors::default();
+        assert_eq!(
+            policy.continuous_growth_reserve_tokens(&factors, Some(6_000.0), [3.0].into_iter(),),
+            6_000.0
         );
     }
 

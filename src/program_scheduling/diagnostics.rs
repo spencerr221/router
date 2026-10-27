@@ -293,7 +293,12 @@ impl ProgramScheduler {
                         ),
                     ),
                     private_tokens: decision
-                        .private_tokens(self.config.progress_ttl.decode_buffer_tokens)
+                        .accounted_private_tokens(
+                            self.config.progress_ttl.decode_buffer_tokens,
+                            self.config
+                                .prediction_profile
+                                .output_reservation_admission_mode,
+                        )
                         .round() as usize,
                     in_flight_requests: runtime.in_flight_requests,
                     waiting_requests: runtime.waiting_requests,
