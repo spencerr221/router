@@ -350,7 +350,12 @@ impl ProgramScheduler {
                 continue;
             };
             let private_tokens = state.decisions.get(program.reference).map(|decision| {
-                decision.private_tokens(self.config.progress_ttl.decode_buffer_tokens)
+                decision.accounted_private_tokens(
+                    self.config.progress_ttl.decode_buffer_tokens,
+                    self.config
+                        .prediction_profile
+                        .output_reservation_admission_mode,
+                )
             });
             match program.status {
                 ProgramStatus::Reasoning => {
@@ -481,8 +486,12 @@ impl ProgramScheduler {
                 {
                     summary.active_programs += 1;
                     if let Some(decision) = state.decisions.get(program.reference) {
-                        summary.router_usage +=
-                            decision.private_tokens(self.config.progress_ttl.decode_buffer_tokens);
+                        summary.router_usage += decision.accounted_private_tokens(
+                            self.config.progress_ttl.decode_buffer_tokens,
+                            self.config
+                                .prediction_profile
+                                .output_reservation_admission_mode,
+                        );
                     }
                 }
             }
@@ -495,8 +504,12 @@ impl ProgramScheduler {
             let Some(summary) = summaries.get_mut(target_id) else {
                 continue;
             };
-            let private_tokens =
-                decision.private_tokens(self.config.progress_ttl.decode_buffer_tokens);
+            let private_tokens = decision.accounted_private_tokens(
+                self.config.progress_ttl.decode_buffer_tokens,
+                self.config
+                    .prediction_profile
+                    .output_reservation_admission_mode,
+            );
             if program.state == ProgramState::Active || program.status == ProgramStatus::Reasoning {
                 summary.accounted_programs += 1;
                 summary.accounted_tokens += private_tokens;
@@ -510,9 +523,19 @@ impl ProgramScheduler {
                 summary.pending_new_program_tokens += private_tokens;
             }
         }
-        let required_tokens = private_context_tokens.saturating_add(
-            output_token_reservation.unwrap_or(self.config.progress_ttl.decode_buffer_tokens),
-        ) as f64;
+        let required_output_tokens = match self
+            .config
+            .prediction_profile
+            .output_reservation_admission_mode
+        {
+            crate::config::types::OutputReservationAdmissionMode::Hard => {
+                output_token_reservation.unwrap_or(self.config.progress_ttl.decode_buffer_tokens)
+            }
+            crate::config::types::OutputReservationAdmissionMode::ContinuousGrowth => {
+                self.config.progress_ttl.decode_buffer_tokens
+            }
+        };
+        let required_tokens = private_context_tokens.saturating_add(required_output_tokens) as f64;
         let capacity = self.config.progress_ttl.token_capacity;
         state
             .model_targets
@@ -727,7 +750,14 @@ impl ProgramScheduler {
                 program.state == ProgramState::Active && program.placement == Some(target_id)
             })
             .filter_map(|program| state.decisions.get(program.reference))
-            .map(|decision| decision.private_tokens(self.config.progress_ttl.decode_buffer_tokens))
+            .map(|decision| {
+                decision.accounted_private_tokens(
+                    self.config.progress_ttl.decode_buffer_tokens,
+                    self.config
+                        .prediction_profile
+                        .output_reservation_admission_mode,
+                )
+            })
             .sum()
     }
 

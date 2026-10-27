@@ -11,6 +11,7 @@ use super::{
     ProgramBindingStrategy, ProgramBindings, ProgramRef, ProgramRuntime,
     ProgramSchedulingEnableKey, ProgramTarget, ProgressTtlConfig, ProgressTtlFactors,
 };
+use crate::config::types::OutputReservationAdmissionMode;
 use crate::config::types::PredictionProfileConfig;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
@@ -268,6 +269,29 @@ impl ProgramDecisionState {
 
     pub(crate) fn private_tokens(&self, decode_buffer_tokens: usize) -> f64 {
         self.private_tokens_with_output(decode_buffer_tokens, None)
+    }
+
+    pub(crate) fn accounted_private_tokens(
+        &self,
+        decode_buffer_tokens: usize,
+        admission_mode: OutputReservationAdmissionMode,
+    ) -> f64 {
+        match admission_mode {
+            OutputReservationAdmissionMode::Hard => self.private_tokens(decode_buffer_tokens),
+            OutputReservationAdmissionMode::ContinuousGrowth => {
+                self.private_tokens_with_output(decode_buffer_tokens, Some(decode_buffer_tokens))
+            }
+        }
+    }
+
+    pub(crate) fn predicted_growth_reserve(
+        &self,
+        decode_buffer_tokens: usize,
+        admission_mode: OutputReservationAdmissionMode,
+    ) -> Option<f64> {
+        (admission_mode == OutputReservationAdmissionMode::ContinuousGrowth)
+            .then_some(self.output_token_reservation)?
+            .map(|tokens| tokens.saturating_sub(decode_buffer_tokens) as f64)
     }
 
     pub(crate) fn private_context_tokens(&self) -> usize {

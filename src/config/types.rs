@@ -132,6 +132,18 @@ pub enum PredictionMode {
     Active,
 }
 
+/// How active output-length reservations participate in capacity admission.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OutputReservationAdmissionMode {
+    /// Treat the full output reservation as immediately required capacity.
+    #[default]
+    Hard,
+    /// Keep only the decode buffer hard and add predicted growth to the
+    /// bypassable continuous-growth reserve.
+    ContinuousGrowth,
+}
+
 /// Shared configuration for workflow-profile predictors.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PredictionProfileConfig {
@@ -165,6 +177,10 @@ pub struct PredictionProfileConfig {
     /// for admission. The decode buffer remains the minimum reservation.
     #[serde(default = "default_output_reservation_factor")]
     pub output_reservation_factor: f64,
+    /// Place predicted output either in hard required capacity or in the
+    /// continuous-growth reserve evaluated by batch-gain admission.
+    #[serde(default)]
+    pub output_reservation_admission_mode: OutputReservationAdmissionMode,
     #[serde(default = "default_output_length_min_support")]
     pub output_length_min_support: usize,
     #[serde(default = "default_output_length_tail_samples")]
@@ -191,6 +207,7 @@ impl Default for PredictionProfileConfig {
             output_length_bucket_bounds_tokens: default_output_length_bucket_bounds_tokens(),
             output_length_quantile: default_output_length_quantile(),
             output_reservation_factor: default_output_reservation_factor(),
+            output_reservation_admission_mode: OutputReservationAdmissionMode::default(),
             output_length_min_support: default_output_length_min_support(),
             output_length_tail_samples: default_output_length_tail_samples(),
             stability_window_size: default_prediction_stability_window_size(),
@@ -1272,10 +1289,14 @@ mod tests {
         assert_eq!(config.prediction_profile.output_reservation_factor, 1.0);
 
         let scaled: ProgramSchedulingConfig = serde_json::from_str(
-            r#"{"prediction_profile":{"mode":"active","output_reservation_factor":0.5}}"#,
+            r#"{"prediction_profile":{"mode":"active","output_reservation_factor":0.5,"output_reservation_admission_mode":"continuous_growth"}}"#,
         )
         .unwrap();
         assert_eq!(scaled.prediction_profile.output_reservation_factor, 0.5);
+        assert_eq!(
+            scaled.prediction_profile.output_reservation_admission_mode,
+            OutputReservationAdmissionMode::ContinuousGrowth
+        );
     }
 
     #[test]

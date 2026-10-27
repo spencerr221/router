@@ -82,8 +82,12 @@ impl ProgramScheduler {
         let Some(decision_before) = state.decisions.get(dispatch.program()) else {
             return;
         };
-        let accounted_tokens_before =
-            decision_before.private_tokens(self.config.progress_ttl.decode_buffer_tokens);
+        let accounted_tokens_before = decision_before.accounted_private_tokens(
+            self.config.progress_ttl.decode_buffer_tokens,
+            self.config
+                .prediction_profile
+                .output_reservation_admission_mode,
+        );
         let shared_prefix_for_cost = decision_before
             .shared_prefix_tokens
             .min(observed_prompt_tokens);
@@ -410,7 +414,12 @@ impl ProgramScheduler {
             .is_some_and(|runtime| runtime.state == ProgramState::Active)
         {
             let accounted_tokens_after = state.decisions[dispatch.program()]
-                .private_tokens(self.config.progress_ttl.decode_buffer_tokens);
+                .accounted_private_tokens(
+                    self.config.progress_ttl.decode_buffer_tokens,
+                    self.config
+                        .prediction_profile
+                        .output_reservation_admission_mode,
+                );
             Self::adjust_usage(
                 &mut state,
                 &target_id,
@@ -561,7 +570,12 @@ impl ProgramScheduler {
                 state.decisions.get(program).map(|decision| {
                     (
                         target_id,
-                        decision.private_tokens(self.config.progress_ttl.decode_buffer_tokens),
+                        decision.accounted_private_tokens(
+                            self.config.progress_ttl.decode_buffer_tokens,
+                            self.config
+                                .prediction_profile
+                                .output_reservation_admission_mode,
+                        ),
                     )
                 })
             });
@@ -637,8 +651,12 @@ impl ProgramScheduler {
                 }
                 let decision = state.decisions.get(program.reference);
                 if let Some(decision) = decision {
-                    let private_tokens =
-                        decision.private_tokens(self.config.progress_ttl.decode_buffer_tokens);
+                    let private_tokens = decision.accounted_private_tokens(
+                        self.config.progress_ttl.decode_buffer_tokens,
+                        self.config
+                            .prediction_profile
+                            .output_reservation_admission_mode,
+                    );
                     router_usage += private_tokens;
                     if program.status == ProgramStatus::Reasoning && decision.pause_when_idle {
                         future_private_relief += private_tokens;
@@ -705,8 +723,12 @@ impl ProgramScheduler {
                 // Preserve the original commit-time accounting point: an earlier
                 // victim may have changed scheduler state since candidates were
                 // ranked, so only the sort key is frozen by the runtime scan.
-                let private_tokens = state.decisions[&victim.reference]
-                    .private_tokens(self.config.progress_ttl.decode_buffer_tokens);
+                let private_tokens = state.decisions[&victim.reference].accounted_private_tokens(
+                    self.config.progress_ttl.decode_buffer_tokens,
+                    self.config
+                        .prediction_profile
+                        .output_reservation_admission_mode,
+                );
                 let relief = private_tokens;
                 let relieved = if victim.status == ProgramStatus::Acting {
                     self.pause_idle(
