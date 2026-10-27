@@ -889,6 +889,12 @@ impl GenerationRequest for CompletionRequest {
         self.prompt.extract_text_for_routing()
     }
 
+    fn exact_input_token_count(&self) -> Option<usize> {
+        self.prompt
+            .is_token_based()
+            .then(|| self.prompt.estimated_token_count())
+    }
+
     fn extract_program_identity_payload(&self) -> Option<serde_json::Value> {
         program_identity_payload(&self.other, self.user.as_deref())
     }
@@ -2424,6 +2430,11 @@ pub trait GenerationRequest: Send + Sync {
         self.extract_text_for_routing()
     }
 
+    /// Return the exact prompt-token count when the request carries token IDs.
+    fn exact_input_token_count(&self) -> Option<usize> {
+        None
+    }
+
     /// Extract only the small body subset used for Program identity parsing.
     fn extract_program_identity_payload(&self) -> Option<serde_json::Value> {
         None
@@ -3498,6 +3509,16 @@ mod tests {
         let request: CompletionRequest = serde_json::from_str(json).unwrap();
         assert_eq!(request.model.as_deref(), Some("text-davinci-003"));
         assert_eq!(request.get_model(), Some("text-davinci-003"));
+    }
+
+    #[test]
+    fn completion_request_reports_exact_token_id_prompt_length() {
+        let request: CompletionRequest = serde_json::from_str(r#"{"prompt":[1,2,3,4]}"#).unwrap();
+        assert_eq!(request.exact_input_token_count(), Some(4));
+
+        let text_request: CompletionRequest =
+            serde_json::from_str(r#"{"prompt":"one two three four"}"#).unwrap();
+        assert_eq!(text_request.exact_input_token_count(), None);
     }
 
     #[test]

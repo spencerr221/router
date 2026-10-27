@@ -161,63 +161,106 @@ impl ProgramScheduler {
                 }
             }
             let previous_tokens = state.decisions.get(&reference).map_or(0.0, |decision| {
-                decision.private_tokens(self.config.progress_ttl.decode_buffer_tokens)
+                decision.accounted_private_tokens(
+                    self.config.progress_ttl.decode_buffer_tokens,
+                    self.config
+                        .prediction_profile
+                        .output_reservation_admission_mode,
+                )
             });
-            self.ensure_decision_state(
+            let pending_output_prediction =
+                if self.config.prediction_profile.mode != PredictionMode::Off {
+                    let keys = output_length::keys_for_request(&identity);
+                    let prediction = state.prediction_profiles.predict_output(
+                        &keys,
+                        self.config.prediction_profile.output_length_quantile,
+                        self.config.prediction_profile.output_length_min_support,
+                        self.config.prediction_profile.output_length_tail_samples,
+                        self.config.prediction_profile.prior_weight,
+                        self.config.prediction_profile.stability_window_size,
+                        self.config.prediction_profile.stability_tolerance,
+                    );
+                    Some(output_length::PendingOutputPrediction { keys, prediction })
+                } else {
+                    None
+                };
+            let raw_output_reservation = output_length::resolve_reservation(
+                self.config.prediction_profile.mode,
+                identity.request_hints().expected_output_tokens,
+                pending_output_prediction
+                    .as_ref()
+                    .and_then(|pending| pending.prediction.as_ref()),
+            );
+            let reservation_factor = self.config.prediction_profile.output_reservation_factor;
+            let output_reservation = raw_output_reservation.with_factor(
+                self.config.progress_ttl.decode_buffer_tokens,
+                reservation_factor,
+            );
+            self.ensure_decision_state_with_reservation(
                 &mut state,
                 &identity,
                 reference.clone(),
                 estimated_context_tokens,
+                output_reservation.tokens,
+                output_reservation.source,
                 arrived_at,
                 routing_text.as_deref(),
             );
-            if self.config.prediction_profile.mode != PredictionMode::Off {
-                let keys = output_length::keys_for_request(&identity);
-                let prediction = state.prediction_profiles.predict_output(
-                    &keys,
-                    self.config.prediction_profile.output_length_quantile,
-                    self.config.prediction_profile.output_length_min_support,
-                    self.config.prediction_profile.output_length_tail_samples,
-                    self.config.prediction_profile.prior_weight,
-                    self.config.prediction_profile.stability_window_size,
-                    self.config.prediction_profile.stability_tolerance,
-                );
+            if let Some(pending) = pending_output_prediction {
+                let prediction = pending.prediction.as_ref();
+                let reservation_tokens = output_reservation
+                    .tokens
+                    .unwrap_or(self.config.progress_ttl.decode_buffer_tokens);
+                let reservation_source = output_reservation
+                    .source
+                    .map_or("default", output_length::OutputReservationSource::as_str);
                 debug!(
                     event = "output_length_prediction",
                     program = %reference.redacted_id(),
-                    predicted_tokens = prediction.as_ref().map(|value| value.tokens),
-                    support = prediction.as_ref().map(|value| value.support),
-                    mature = prediction.as_ref().is_some_and(|value| value.mature),
-                    backoff_level = prediction.as_ref().map(|value| value.backoff_level),
+                    predicted_tokens = prediction.map(|value| value.tokens),
+                    support = prediction.map(|value| value.support),
+                    mature = prediction.is_some_and(|value| value.mature),
+                    backoff_level = prediction.map(|value| value.backoff_level),
                     source = prediction
-                        .as_ref()
                         .map(|value| value.source.as_str())
                         .unwrap_or("none"),
-                    "Workflow prediction shadow result"
+                    raw_reservation_tokens = raw_output_reservation.tokens,
+                    reservation_tokens,
+                    reservation_source,
+                    reservation_factor,
+                    "Workflow output-length prediction result"
                 );
-                if let (Some(target_id), Some(prediction)) = (
-                    state
-                        .decisions
-                        .get(&reference)
-                        .and_then(|decision| decision.last_target.as_deref()),
-                    prediction.as_ref(),
-                ) {
-                    RouterMetrics::record_workflow_output_prediction(
+                if let Some(target_id) = state
+                    .decisions
+                    .get(&reference)
+                    .and_then(|decision| decision.last_target.as_deref())
+                {
+                    RouterMetrics::record_workflow_output_reservation(
                         target_id,
-                        prediction.source.as_str(),
-                        prediction.tokens,
-                        prediction.support,
-                        prediction.mature,
-                        prediction.backoff_level,
+                        reservation_source,
+                        reservation_tokens,
                     );
+                    if let Some(prediction) = prediction {
+                        RouterMetrics::record_workflow_output_prediction(
+                            target_id,
+                            prediction.source.as_str(),
+                            prediction.tokens,
+                            prediction.support,
+                            prediction.mature,
+                            prediction.backoff_level,
+                        );
+                    }
                 }
                 if let Some(decision) = state.decisions.get_mut(&reference) {
-                    decision.pending_output_prediction =
-                        Some(output_length::PendingOutputPrediction { keys, prediction });
+                    decision.pending_output_prediction = Some(pending);
                 }
             }
-            let current_tokens = state.decisions[&reference]
-                .private_tokens(self.config.progress_ttl.decode_buffer_tokens);
+            let current_tokens = state.decisions[&reference].accounted_private_tokens(
+                self.config.progress_ttl.decode_buffer_tokens,
+                self.config
+                    .prediction_profile
+                    .output_reservation_admission_mode,
+            );
             if let Some(placement) = state
                 .runtime
                 .view(&reference)
@@ -227,7 +270,7 @@ impl ProgramScheduler {
                     .decisions
                     .get(&reference)
                     .is_some_and(|decision| !decision.pause_when_idle);
-                if account_growth && current_tokens > previous_tokens {
+                if account_growth && current_tokens != previous_tokens {
                     Self::adjust_usage(&mut state, &placement, current_tokens - previous_tokens);
                 }
             } else {
@@ -356,10 +399,14 @@ impl ProgramScheduler {
     pub(crate) fn cancel_retained_request(&self, handle: &ProgramRequestHandle) {
         let mut state = self.state.lock();
         let before = state.runtime.view(handle.program());
-        let before_tokens = state
-            .decisions
-            .get(handle.program())
-            .map(|decision| decision.private_tokens(self.config.progress_ttl.decode_buffer_tokens));
+        let before_tokens = state.decisions.get(handle.program()).map(|decision| {
+            decision.accounted_private_tokens(
+                self.config.progress_ttl.decode_buffer_tokens,
+                self.config
+                    .prediction_profile
+                    .output_reservation_admission_mode,
+            )
+        });
         if !state.runtime.cancel_request(handle) {
             return;
         }
@@ -611,13 +658,11 @@ impl ProgramScheduler {
             .collect::<Vec<_>>();
         let used_tokens = self.target_usage(state, target_id, now);
         let active_count = active.len();
-        let expected_output_tokens = state
-            .runtime
-            .front_request_hints(program)
-            .and_then(|hints| hints.expected_output_tokens);
-        let required_tokens = decision.private_tokens_with_output(
+        let required_tokens = decision.accounted_private_tokens(
             self.config.progress_ttl.decode_buffer_tokens,
-            expected_output_tokens,
+            self.config
+                .prediction_profile
+                .output_reservation_admission_mode,
         );
         let capacity = self.config.progress_ttl.token_capacity;
         let count_fits =
@@ -637,16 +682,25 @@ impl ProgramScheduler {
         };
         let low = capacity_tokens as f64 * self.config.progress_ttl.low_watermark_ratio;
         let immediate_fits = used_tokens + required_tokens <= low;
+        let candidate_growth_reserve = decision.predicted_growth_reserve(
+            self.config.progress_ttl.decode_buffer_tokens,
+            self.config
+                .prediction_profile
+                .output_reservation_admission_mode,
+        );
         let factors = state.rank_factors.get(target_id);
-        let reserve_tokens = factors.map_or(0.0, |factors| {
+        let reserve_tokens = factors.map_or(candidate_growth_reserve.unwrap_or(0.0), |factors| {
             let target_rounds = self.policy.target_rounds(factors);
             let active_remaining = active.iter().filter_map(|active| {
                 state.decisions.get(active.reference).map(|active_state| {
                     (target_rounds - active_state.rounds_since_activation as f64).max(0.0)
                 })
             });
-            self.policy
-                .continuous_growth_reserve_tokens(factors, active_remaining)
+            self.policy.continuous_growth_reserve_tokens(
+                factors,
+                candidate_growth_reserve,
+                active_remaining,
+            )
         });
         let reserve_fits = used_tokens + required_tokens + reserve_tokens <= low;
         if forced || (count_fits(active_count) && immediate_fits && reserve_fits) {
@@ -664,6 +718,8 @@ impl ProgramScheduler {
         }
         let factors = factors?;
         let target_rounds = self.policy.target_rounds(factors);
+        let candidate_growth_reserve_tokens = candidate_growth_reserve
+            .unwrap_or_else(|| factors.average_context_growth_tokens() * target_rounds);
         let running = active
             .iter()
             .filter(|active| active.status == ProgramStatus::Reasoning)
@@ -696,6 +752,7 @@ impl ProgramScheduler {
             candidate_context_tokens: decision.estimated_context_tokens,
             used_tokens,
             required_tokens,
+            candidate_growth_reserve_tokens,
             protected_remaining_rounds: &protected_rounds,
             protected_recovery_cost_seconds: &protected_costs,
             candidate_recovery_cost_seconds: self.policy.cache_miss_impact_seconds(
@@ -726,11 +783,14 @@ impl ProgramScheduler {
             .decisions
             .get(program)
             .and_then(|decision| decision.last_target.clone());
-        let Some(tokens) = state
-            .decisions
-            .get(program)
-            .map(|decision| decision.private_tokens(self.config.progress_ttl.decode_buffer_tokens))
-        else {
+        let Some(tokens) = state.decisions.get(program).map(|decision| {
+            decision.accounted_private_tokens(
+                self.config.progress_ttl.decode_buffer_tokens,
+                self.config
+                    .prediction_profile
+                    .output_reservation_admission_mode,
+            )
+        }) else {
             return false;
         };
         if !state.runtime.activate(program, target_id.to_string()) {
@@ -817,11 +877,14 @@ impl ProgramScheduler {
         let Some(target_id) = state.runtime.placement(program).map(str::to_string) else {
             return false;
         };
-        let Some(tokens) = state
-            .decisions
-            .get(program)
-            .map(|decision| decision.private_tokens(self.config.progress_ttl.decode_buffer_tokens))
-        else {
+        let Some(tokens) = state.decisions.get(program).map(|decision| {
+            decision.accounted_private_tokens(
+                self.config.progress_ttl.decode_buffer_tokens,
+                self.config
+                    .prediction_profile
+                    .output_reservation_admission_mode,
+            )
+        }) else {
             return false;
         };
         if !state.runtime.pause_idle(program) {
@@ -898,8 +961,9 @@ impl Drop for AdmissionGuard<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::types::OutputReservationAdmissionMode;
     use crate::program_scheduling::scheduler_state::RankObservationState;
-    use crate::program_scheduling::ProgramSchedulerConfig;
+    use crate::program_scheduling::{ProgramSchedulerConfig, RequestSample};
     use serde_json::json;
     use std::time::Duration;
 
@@ -1062,6 +1126,277 @@ mod tests {
             decision.private_tokens(scheduler.config.progress_ttl.decode_buffer_tokens),
             200.0
         );
+    }
+
+    #[tokio::test]
+    async fn active_output_prediction_sets_request_capacity_reservation() {
+        use crate::program_scheduling::prediction_profile::OutputLengthKey;
+
+        let mut config = ProgramSchedulerConfig::default();
+        config.progress_ttl.token_capacity = Some(1_000);
+        config.prediction_profile.mode = PredictionMode::Active;
+        config.prediction_profile.output_length_quantile = 0.5;
+        config.prediction_profile.output_length_min_support = 1;
+        config.prediction_profile.output_length_tail_samples = 1;
+        config.prediction_profile.stability_window_size = 2;
+        config.prediction_profile.stability_tolerance = 10.0;
+        let scheduler = ProgramScheduler::new(config);
+        {
+            let mut state = scheduler.state.lock();
+            let global = OutputLengthKey {
+                workflow_profile_id: None,
+                profile_version: None,
+                model_pool: None,
+                profile_role: None,
+            };
+            state
+                .prediction_profiles
+                .observe_output(std::slice::from_ref(&global), 200);
+            state
+                .prediction_profiles
+                .observe_output(std::slice::from_ref(&global), 220);
+        }
+
+        let dispatch = scheduler
+            .acquire(identity("active-output"), 100, &[target()], None)
+            .await
+            .unwrap();
+        let state = scheduler.state.lock();
+        let decision = &state.decisions[dispatch.program()];
+        assert_eq!(decision.output_token_reservation, Some(256));
+        assert_eq!(
+            decision.output_token_reservation_source,
+            Some(output_length::OutputReservationSource::Prediction)
+        );
+        assert_eq!(
+            decision.private_tokens(scheduler.config.progress_ttl.decode_buffer_tokens),
+            356.0
+        );
+        drop(state);
+
+        scheduler.complete(&dispatch, true, false, Some(100), Some(0.1));
+        let state = scheduler.state.lock();
+        let decision = &state.decisions[dispatch.program()];
+        assert_eq!(decision.output_token_reservation, None);
+        assert_eq!(decision.output_token_reservation_source, None);
+    }
+
+    #[tokio::test]
+    async fn explicit_output_length_overrides_active_prediction() {
+        use crate::program_scheduling::prediction_profile::OutputLengthKey;
+
+        let mut config = ProgramSchedulerConfig::default();
+        config.progress_ttl.token_capacity = Some(1_000);
+        config.prediction_profile.mode = PredictionMode::Active;
+        config.prediction_profile.output_reservation_factor = 0.5;
+        config.prediction_profile.output_length_quantile = 0.5;
+        config.prediction_profile.output_length_min_support = 1;
+        config.prediction_profile.output_length_tail_samples = 1;
+        config.prediction_profile.stability_window_size = 2;
+        config.prediction_profile.stability_tolerance = 10.0;
+        let scheduler = ProgramScheduler::new(config);
+        {
+            let mut state = scheduler.state.lock();
+            let global = OutputLengthKey {
+                workflow_profile_id: None,
+                profile_version: None,
+                model_pool: None,
+                profile_role: None,
+            };
+            state
+                .prediction_profiles
+                .observe_output(std::slice::from_ref(&global), 200);
+            state
+                .prediction_profiles
+                .observe_output(std::slice::from_ref(&global), 220);
+        }
+
+        let dispatch = scheduler
+            .acquire(
+                identity_with_expected_output("explicit-output", 600),
+                100,
+                &[target()],
+                None,
+            )
+            .await
+            .unwrap();
+        let state = scheduler.state.lock();
+        let decision = &state.decisions[dispatch.program()];
+        assert_eq!(decision.output_token_reservation, Some(350));
+        assert_eq!(
+            decision.output_token_reservation_source,
+            Some(output_length::OutputReservationSource::Explicit)
+        );
+        assert_eq!(
+            decision.private_tokens(scheduler.config.progress_ttl.decode_buffer_tokens),
+            450.0
+        );
+    }
+
+    #[tokio::test]
+    async fn active_prediction_blocks_admission_when_reserved_capacity_does_not_fit() {
+        use crate::program_scheduling::prediction_profile::OutputLengthKey;
+
+        let mut config = ProgramSchedulerConfig::default();
+        config.progress_ttl.token_capacity = Some(600);
+        config.prediction_profile.mode = PredictionMode::Active;
+        config.prediction_profile.output_length_quantile = 0.5;
+        config.prediction_profile.output_length_min_support = 1;
+        config.prediction_profile.output_length_tail_samples = 1;
+        config.prediction_profile.stability_window_size = 2;
+        config.prediction_profile.stability_tolerance = 10.0;
+        let scheduler = ProgramScheduler::new(config);
+        {
+            let mut state = scheduler.state.lock();
+            let global = OutputLengthKey {
+                workflow_profile_id: None,
+                profile_version: None,
+                model_pool: None,
+                profile_role: None,
+            };
+            state
+                .prediction_profiles
+                .observe_output(std::slice::from_ref(&global), 200);
+            state
+                .prediction_profiles
+                .observe_output(std::slice::from_ref(&global), 220);
+        }
+        let target = target();
+        let _first = scheduler
+            .acquire(
+                identity("active-first"),
+                100,
+                std::slice::from_ref(&target),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let second = tokio::time::timeout(
+            Duration::from_millis(10),
+            scheduler.acquire(identity("active-second"), 100, &[target], None),
+        )
+        .await;
+        assert!(second.is_err());
+    }
+
+    #[test]
+    fn continuous_growth_mode_keeps_prompt_hard_and_prediction_bypassable() {
+        let mut config = ProgramSchedulerConfig::default();
+        config.progress_ttl.token_capacity = Some(500);
+        config.progress_ttl.stats_window_size = 2;
+        config.progress_ttl.prefill.intercept_seconds = 0.0;
+        config.progress_ttl.prefill.linear_seconds_per_1k_tokens = 0.0;
+        config
+            .progress_ttl
+            .prefill
+            .quadratic_seconds_per_1k_tokens_squared = 0.0;
+        config.prediction_profile.mode = PredictionMode::Active;
+        config.prediction_profile.output_reservation_admission_mode =
+            OutputReservationAdmissionMode::ContinuousGrowth;
+        let scheduler = ProgramScheduler::new(config);
+        scheduler.sync_targets("model", &[target()]);
+        let now = Instant::now();
+        let first = identity("soft-first");
+        let mut state = scheduler.state.lock();
+        let first_handle = state.runtime.retain_request(&first, 100, None, now);
+        scheduler.ensure_decision_state(
+            &mut state,
+            &first,
+            first_handle.program().clone(),
+            100,
+            now,
+            None,
+        );
+        let first_plan = scheduler
+            .rank_admission_plan(&state, first_handle.program(), "rank-0", now)
+            .unwrap();
+        assert!(scheduler.commit_admission(
+            &mut state,
+            first_handle.program(),
+            "rank-0",
+            first_plan,
+            now,
+        ));
+        state
+            .decisions
+            .get_mut(first_handle.program())
+            .unwrap()
+            .rounds_since_activation = 6;
+
+        let factors = state.rank_factors.entry("rank-0".to_string()).or_default();
+        for index in 0..2 {
+            factors.push_request(
+                RequestSample {
+                    prompt_tokens: 100,
+                    completion_tokens: 256,
+                    cached_prompt_tokens: 100,
+                    context_growth_tokens: Some(100),
+                    e2e_seconds: 2.0,
+                    decode_seconds: Some(1.0),
+                    queue_seconds: 0.0,
+                    rounds_since_ttl_pause: 3,
+                    finished_at: now + Duration::from_secs(index),
+                },
+                2,
+            );
+        }
+
+        let second = identity("soft-second");
+        let second_handle = state.runtime.retain_request(&second, 100, None, now);
+        scheduler.ensure_decision_state_with_reservation(
+            &mut state,
+            &second,
+            second_handle.program().clone(),
+            100,
+            Some(256),
+            Some(output_length::OutputReservationSource::Explicit),
+            now,
+            None,
+        );
+        let decision = &state.decisions[second_handle.program()];
+        assert_eq!(
+            decision.accounted_private_tokens(
+                scheduler.config.progress_ttl.decode_buffer_tokens,
+                OutputReservationAdmissionMode::ContinuousGrowth,
+            ),
+            200.0
+        );
+        assert_eq!(
+            decision.predicted_growth_reserve(
+                scheduler.config.progress_ttl.decode_buffer_tokens,
+                OutputReservationAdmissionMode::ContinuousGrowth,
+            ),
+            Some(156.0)
+        );
+
+        let plan = scheduler
+            .rank_admission_plan(&state, second_handle.program(), "rank-0", now)
+            .expect("mature batch-gain should be allowed to bypass only the soft reserve");
+        assert_eq!(plan.required_tokens, 200.0);
+        assert_eq!(plan.reserve_tokens, 156.0);
+        assert!(plan.batch_gain);
+    }
+
+    #[tokio::test]
+    async fn continuous_growth_mode_still_rejects_a_prompt_that_exceeds_capacity() {
+        let mut config = ProgramSchedulerConfig::default();
+        config.progress_ttl.token_capacity = Some(150);
+        config.prediction_profile.mode = PredictionMode::Active;
+        config.prediction_profile.output_reservation_admission_mode =
+            OutputReservationAdmissionMode::ContinuousGrowth;
+        let scheduler = ProgramScheduler::new(config);
+        let result = tokio::time::timeout(
+            Duration::from_millis(10),
+            scheduler.acquire(
+                identity_with_expected_output("hard-prompt", 1_000),
+                100,
+                &[target()],
+                None,
+            ),
+        )
+        .await;
+        assert!(result.is_err());
     }
 
     #[test]
@@ -1237,6 +1572,33 @@ mod tests {
             .rank_admission_plan(&state, handle.program(), "rank-0", now)
             .unwrap();
         assert_eq!(plan.required_tokens, 300.0);
+    }
+
+    #[test]
+    fn scaled_output_reservation_controls_admission_required_tokens() {
+        let mut config = ProgramSchedulerConfig::default();
+        config.progress_ttl.token_capacity = Some(1_000);
+        config.progress_ttl.low_watermark_ratio = 1.0;
+        let scheduler = ProgramScheduler::new(config);
+        scheduler.sync_targets("model", &[target()]);
+        let now = Instant::now();
+        let identity = identity_with_expected_output("program", 600);
+        let mut state = scheduler.state.lock();
+        let handle = state.runtime.retain_request(&identity, 100, None, now);
+        scheduler.ensure_decision_state_with_reservation(
+            &mut state,
+            &identity,
+            handle.program().clone(),
+            100,
+            Some(350),
+            Some(output_length::OutputReservationSource::Explicit),
+            now,
+            None,
+        );
+        let plan = scheduler
+            .rank_admission_plan(&state, handle.program(), "rank-0", now)
+            .unwrap();
+        assert_eq!(plan.required_tokens, 450.0);
     }
 
     #[test]

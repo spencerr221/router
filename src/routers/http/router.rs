@@ -649,6 +649,7 @@ impl Router {
             &model_pool,
             endpoint,
             &input_text,
+            typed_req.exact_input_token_count(),
         )
         .await
     }
@@ -680,6 +681,7 @@ impl Router {
             &model_pool,
             endpoint,
             input_text,
+            None,
         )
         .await
     }
@@ -691,11 +693,14 @@ impl Router {
         model_pool: &ResolvedProgramModelPool,
         endpoint: &str,
         input_text: &str,
+        exact_context_tokens: Option<usize>,
     ) -> Result<Option<ProgramCompletion>, ScheduleError> {
-        let (estimated_context_tokens, calibration) = self.program_token_estimator.estimate(
+        let (text_estimated_context_tokens, calibration) = self.program_token_estimator.estimate(
             TokenEstimateScope::new(&model_pool.scheduler_key, endpoint),
             input_text,
         );
+        let estimated_context_tokens =
+            exact_context_tokens.unwrap_or(text_estimated_context_tokens);
         let targets = self.program_targets_for_model(model_pool);
         let routing_text = scheduler
             .uses_cache_aware_binding()

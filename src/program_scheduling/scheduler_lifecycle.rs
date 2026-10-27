@@ -82,8 +82,12 @@ impl ProgramScheduler {
         let Some(decision_before) = state.decisions.get(dispatch.program()) else {
             return;
         };
-        let accounted_tokens_before =
-            decision_before.private_tokens(self.config.progress_ttl.decode_buffer_tokens);
+        let accounted_tokens_before = decision_before.accounted_private_tokens(
+            self.config.progress_ttl.decode_buffer_tokens,
+            self.config
+                .prediction_profile
+                .output_reservation_admission_mode,
+        );
         let shared_prefix_for_cost = decision_before
             .shared_prefix_tokens
             .min(observed_prompt_tokens);
@@ -316,6 +320,7 @@ impl ProgramScheduler {
                 );
             }
             decision.output_token_reservation = None;
+            decision.output_token_reservation_source = None;
         }
         if self.config.prediction_profile.mode != PredictionMode::Off {
             if let Some((pending, actual_tokens)) = output_observation {
@@ -409,7 +414,12 @@ impl ProgramScheduler {
             .is_some_and(|runtime| runtime.state == ProgramState::Active)
         {
             let accounted_tokens_after = state.decisions[dispatch.program()]
-                .private_tokens(self.config.progress_ttl.decode_buffer_tokens);
+                .accounted_private_tokens(
+                    self.config.progress_ttl.decode_buffer_tokens,
+                    self.config
+                        .prediction_profile
+                        .output_reservation_admission_mode,
+                );
             Self::adjust_usage(
                 &mut state,
                 &target_id,
@@ -560,7 +570,12 @@ impl ProgramScheduler {
                 state.decisions.get(program).map(|decision| {
                     (
                         target_id,
-                        decision.private_tokens(self.config.progress_ttl.decode_buffer_tokens),
+                        decision.accounted_private_tokens(
+                            self.config.progress_ttl.decode_buffer_tokens,
+                            self.config
+                                .prediction_profile
+                                .output_reservation_admission_mode,
+                        ),
                     )
                 })
             });
@@ -621,16 +636,10 @@ impl ProgramScheduler {
         for target_id in target_ids {
             let high = capacity as f64 * self.config.progress_ttl.high_watermark_ratio;
             let low = capacity as f64 * self.config.progress_ttl.low_watermark_ratio;
-            let average_completion = state
-                .rank_factors
-                .get(&target_id)
-                .map_or(0.0, |factors| factors.average_completion_tokens().ceil());
             let average_prompt = state
                 .rank_factors
                 .get(&target_id)
                 .map_or(1.0, |factors| factors.average_prompt_tokens().max(1.0));
-            let mut reasoning_count = 0;
-            let mut marked_reasoning_count = 0;
             let mut future_private_relief = 0.0;
             let mut router_usage = 0.0;
             let mut victims = Vec::new();
@@ -642,11 +651,14 @@ impl ProgramScheduler {
                 }
                 let decision = state.decisions.get(program.reference);
                 if let Some(decision) = decision {
-                    let private_tokens =
-                        decision.private_tokens(self.config.progress_ttl.decode_buffer_tokens);
+                    let private_tokens = decision.accounted_private_tokens(
+                        self.config.progress_ttl.decode_buffer_tokens,
+                        self.config
+                            .prediction_profile
+                            .output_reservation_admission_mode,
+                    );
                     router_usage += private_tokens;
                     if program.status == ProgramStatus::Reasoning && decision.pause_when_idle {
-                        marked_reasoning_count += 1;
                         future_private_relief += private_tokens;
                     }
                     let is_victim = match program.status {
@@ -676,23 +688,16 @@ impl ProgramScheduler {
                         });
                     }
                 }
-                if program.status == ProgramStatus::Reasoning {
-                    reasoning_count += 1;
-                }
             }
-            // Admission and resume use current occupancy: a reasoning Program
-            // marked to pause still owns its KV until the request finishes.
-            // Capacity repair is different: it is selecting any *additional*
-            // victims for the same future idle boundary, so relief already
-            // committed by earlier repair decisions must be subtracted here.
-            let future_completion_relief = average_completion * marked_reasoning_count as f64;
+            // Backend-based usage includes each active reasoning request's
+            // effective output reservation. A reasoning Program marked to
+            // pause still owns its current KV until completion, while capacity
+            // repair subtracts the complete future private relief already
+            // committed by earlier decisions.
             let target_usage = self
                 .observed_target_usage(state, &target_id, now)
                 .unwrap_or(router_usage);
-            let mut projected = (target_usage + average_completion * reasoning_count as f64
-                - future_private_relief
-                - future_completion_relief)
-                .max(0.0);
+            let mut projected = (target_usage - future_private_relief).max(0.0);
             if projected <= high {
                 continue;
             }
@@ -718,14 +723,13 @@ impl ProgramScheduler {
                 // Preserve the original commit-time accounting point: an earlier
                 // victim may have changed scheduler state since candidates were
                 // ranked, so only the sort key is frozen by the runtime scan.
-                let private_tokens = state.decisions[&victim.reference]
-                    .private_tokens(self.config.progress_ttl.decode_buffer_tokens);
-                let relief = private_tokens
-                    + if victim.status == ProgramStatus::Reasoning {
-                        average_completion
-                    } else {
-                        0.0
-                    };
+                let private_tokens = state.decisions[&victim.reference].accounted_private_tokens(
+                    self.config.progress_ttl.decode_buffer_tokens,
+                    self.config
+                        .prediction_profile
+                        .output_reservation_admission_mode,
+                );
+                let relief = private_tokens;
                 let relieved = if victim.status == ProgramStatus::Acting {
                     self.pause_idle(
                         state,

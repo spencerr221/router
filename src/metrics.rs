@@ -838,6 +838,21 @@ impl RouterMetrics {
         .increment(1);
     }
 
+    pub fn record_workflow_output_reservation(target: &str, source: &'static str, tokens: usize) {
+        counter!(
+            "vllm_router_workflow_output_reservation_total",
+            "target" => target.to_string(),
+            "source" => source
+        )
+        .increment(1);
+        histogram!(
+            "vllm_router_workflow_output_reserved_tokens",
+            "target" => target.to_string(),
+            "source" => source
+        )
+        .record(tokens as f64);
+    }
+
     pub fn record_workflow_output_observation(
         target: &str,
         actual_tokens: usize,
@@ -862,7 +877,7 @@ impl RouterMetrics {
                 histogram!(
                     "vllm_router_workflow_output_reservation_error_tokens",
                     "target" => target.to_string(),
-                    "quantile" => quantile,
+                    "prediction_quantile" => quantile,
                     "direction" => if covered { "over_reserved" } else { "under_reserved" }
                 )
                 .record(predicted.abs_diff(actual_tokens) as f64);

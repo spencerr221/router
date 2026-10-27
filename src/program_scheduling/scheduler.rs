@@ -3,6 +3,7 @@
 //! Rank-local and global decision algorithms live in sibling modules. This
 //! file owns atomic state access, target discovery, and observation rebasing.
 
+use super::output_length::OutputReservationSource;
 use super::scheduler_state::{
     CapacityAccountingSource, ProgramDecisionState, ProgramSchedulerState, RankObservationState,
 };
@@ -248,7 +249,12 @@ impl ProgramScheduler {
                 placement_key,
                 expected_resume,
             );
-            let candidates = self.binding_candidates(state, &identity, Instant::now());
+            let output_reservation = state
+                .decisions
+                .get(&program)
+                .and_then(|decision| decision.output_token_reservation);
+            let candidates =
+                self.binding_candidates(state, &identity, output_reservation, Instant::now());
             let replacement = state.bindings.bind(&identity, &candidates, None);
             if let Some(decision) = state.decisions.get_mut(&program) {
                 decision.home_target = replacement.clone();
@@ -344,7 +350,12 @@ impl ProgramScheduler {
                 continue;
             };
             let private_tokens = state.decisions.get(program.reference).map(|decision| {
-                decision.private_tokens(self.config.progress_ttl.decode_buffer_tokens)
+                decision.accounted_private_tokens(
+                    self.config.progress_ttl.decode_buffer_tokens,
+                    self.config
+                        .prediction_profile
+                        .output_reservation_admission_mode,
+                )
             });
             match program.status {
                 ProgramStatus::Reasoning => {
@@ -398,8 +409,10 @@ impl ProgramScheduler {
             let estimated_reasoning_tokens = native_used_tokens.map(|native_used| {
                 let running = raw.running_requests.unwrap_or(0);
                 if running > 0 {
-                    native_used * checkpoint.active_reasoning_programs.max(running) as f64
-                        / running as f64
+                    let observed_running_tokens = native_used
+                        * checkpoint.active_reasoning_programs.max(running) as f64
+                        / running as f64;
+                    observed_running_tokens.max(checkpoint.active_reasoning_private_tokens)
                 } else if checkpoint.active_reasoning_programs > 0 {
                     checkpoint.active_reasoning_private_tokens
                 } else {
@@ -444,6 +457,7 @@ impl ProgramScheduler {
         &self,
         state: &ProgramSchedulerState,
         identity: &ProgramIdentity,
+        output_token_reservation: Option<usize>,
         now: Instant,
     ) -> Vec<ProgramBindingCandidate> {
         let Some(target_ids) = state.model_targets.get(identity.model_pool()) else {
@@ -453,12 +467,17 @@ impl ProgramScheduler {
             .iter()
             .map(|target_id| (target_id.as_str(), BindingRuntimeSummary::default()))
             .collect::<HashMap<_, _>>();
-        let mut estimated_context_tokens = 0;
+        let mut private_context_tokens = 0;
         for program in state.runtime.iter_views() {
             if program.reference.model_pool() == identity.model_pool()
                 && program.reference.program_id() == identity.program_id()
             {
-                estimated_context_tokens = program.estimated_context_tokens;
+                private_context_tokens = state
+                    .decisions
+                    .get(program.reference)
+                    .map_or(program.estimated_context_tokens, |decision| {
+                        decision.private_context_tokens()
+                    });
             }
             if program.state == ProgramState::Active {
                 if let Some(summary) = program
@@ -467,8 +486,12 @@ impl ProgramScheduler {
                 {
                     summary.active_programs += 1;
                     if let Some(decision) = state.decisions.get(program.reference) {
-                        summary.router_usage +=
-                            decision.private_tokens(self.config.progress_ttl.decode_buffer_tokens);
+                        summary.router_usage += decision.accounted_private_tokens(
+                            self.config.progress_ttl.decode_buffer_tokens,
+                            self.config
+                                .prediction_profile
+                                .output_reservation_admission_mode,
+                        );
                     }
                 }
             }
@@ -481,8 +504,12 @@ impl ProgramScheduler {
             let Some(summary) = summaries.get_mut(target_id) else {
                 continue;
             };
-            let private_tokens =
-                decision.private_tokens(self.config.progress_ttl.decode_buffer_tokens);
+            let private_tokens = decision.accounted_private_tokens(
+                self.config.progress_ttl.decode_buffer_tokens,
+                self.config
+                    .prediction_profile
+                    .output_reservation_admission_mode,
+            );
             if program.state == ProgramState::Active || program.status == ProgramStatus::Reasoning {
                 summary.accounted_programs += 1;
                 summary.accounted_tokens += private_tokens;
@@ -496,9 +523,19 @@ impl ProgramScheduler {
                 summary.pending_new_program_tokens += private_tokens;
             }
         }
-        let required_tokens = estimated_context_tokens
-            .saturating_add(self.config.progress_ttl.decode_buffer_tokens)
-            as f64;
+        let required_output_tokens = match self
+            .config
+            .prediction_profile
+            .output_reservation_admission_mode
+        {
+            crate::config::types::OutputReservationAdmissionMode::Hard => {
+                output_token_reservation.unwrap_or(self.config.progress_ttl.decode_buffer_tokens)
+            }
+            crate::config::types::OutputReservationAdmissionMode::ContinuousGrowth => {
+                self.config.progress_ttl.decode_buffer_tokens
+            }
+        };
+        let required_tokens = private_context_tokens.saturating_add(required_output_tokens) as f64;
         let capacity = self.config.progress_ttl.token_capacity;
         state
             .model_targets
@@ -535,12 +572,38 @@ impl ProgramScheduler {
             .collect()
     }
 
+    #[cfg(test)]
     pub(crate) fn ensure_decision_state(
         &self,
         state: &mut ProgramSchedulerState,
         identity: &ProgramIdentity,
         reference: ProgramRef,
         estimated_context_tokens: usize,
+        now: Instant,
+        routing_text: Option<&str>,
+    ) {
+        let output_token_reservation = identity.request_hints().expected_output_tokens;
+        self.ensure_decision_state_with_reservation(
+            state,
+            identity,
+            reference,
+            estimated_context_tokens,
+            output_token_reservation,
+            output_token_reservation.map(|_| OutputReservationSource::Explicit),
+            now,
+            routing_text,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn ensure_decision_state_with_reservation(
+        &self,
+        state: &mut ProgramSchedulerState,
+        identity: &ProgramIdentity,
+        reference: ProgramRef,
+        estimated_context_tokens: usize,
+        output_token_reservation: Option<usize>,
+        output_token_reservation_source: Option<OutputReservationSource>,
         now: Instant,
         routing_text: Option<&str>,
     ) {
@@ -565,13 +628,14 @@ impl ProgramScheduler {
             decision.spawn_reason = identity.spawn_reason().map(str::to_string);
             decision.workflow_profile_id = identity.workflow_profile_id().map(str::to_string);
             decision.profile_version = identity.profile_version().map(str::to_string);
-            decision.output_token_reservation = identity.request_hints().expected_output_tokens;
+            decision.output_token_reservation = output_token_reservation;
+            decision.output_token_reservation_source = output_token_reservation_source;
             decision.step_id = identity
                 .step_id()
                 .unwrap_or_else(|| decision.step_id.saturating_add(1));
             return;
         }
-        let candidates = self.binding_candidates(state, identity, now);
+        let candidates = self.binding_candidates(state, identity, output_token_reservation, now);
         let home_target = state.bindings.bind(identity, &candidates, routing_text);
         let mut decision = ProgramDecisionState::new(
             identity.placement_key().to_string(),
@@ -590,7 +654,8 @@ impl ProgramScheduler {
         decision.spawn_reason = identity.spawn_reason().map(str::to_string);
         decision.workflow_profile_id = identity.workflow_profile_id().map(str::to_string);
         decision.profile_version = identity.profile_version().map(str::to_string);
-        decision.output_token_reservation = identity.request_hints().expected_output_tokens;
+        decision.output_token_reservation = output_token_reservation;
+        decision.output_token_reservation_source = output_token_reservation_source;
         decision.step_id = identity.step_id().unwrap_or(0);
         state.decisions.insert(reference, decision);
     }
@@ -685,7 +750,14 @@ impl ProgramScheduler {
                 program.state == ProgramState::Active && program.placement == Some(target_id)
             })
             .filter_map(|program| state.decisions.get(program.reference))
-            .map(|decision| decision.private_tokens(self.config.progress_ttl.decode_buffer_tokens))
+            .map(|decision| {
+                decision.accounted_private_tokens(
+                    self.config.progress_ttl.decode_buffer_tokens,
+                    self.config
+                        .prediction_profile
+                        .output_reservation_admission_mode,
+                )
+            })
             .sum()
     }
 
@@ -783,6 +855,96 @@ mod tests {
         assert_eq!(
             scheduler.target_usage(&state, "rank-0", Instant::now()),
             550.0
+        );
+    }
+
+    #[tokio::test]
+    async fn backend_observation_uses_max_of_native_and_projected_request_tokens() {
+        use crate::config::types::PredictionMode;
+        use crate::program_scheduling::prediction_profile::OutputLengthKey;
+
+        let mut config = ProgramSchedulerConfig::default();
+        config.progress_ttl.token_capacity = Some(1_000);
+        config.prediction_profile.mode = PredictionMode::Active;
+        config.prediction_profile.output_length_quantile = 0.5;
+        config.prediction_profile.output_length_min_support = 1;
+        config.prediction_profile.output_length_tail_samples = 1;
+        config.prediction_profile.stability_window_size = 2;
+        config.prediction_profile.stability_tolerance = 10.0;
+        let scheduler = ProgramScheduler::new(config);
+        let target = ProgramTarget {
+            id: "rank-0".into(),
+            base_url: "http://worker".into(),
+            dp_rank: Some(0),
+        };
+        {
+            let mut state = scheduler.state.lock();
+            let global = OutputLengthKey {
+                workflow_profile_id: None,
+                profile_version: None,
+                model_pool: None,
+                profile_role: None,
+            };
+            state
+                .prediction_profiles
+                .observe_output(std::slice::from_ref(&global), 200);
+            state
+                .prediction_profiles
+                .observe_output(std::slice::from_ref(&global), 220);
+        }
+        let identity = ProgramIdentity::from_request(
+            None,
+            Some(&json!({"vllm_xargs":{"agentic_context":{
+                "program_id":"active","task_id":null,"expected_resume":true
+            }}})),
+            Some("model"),
+        )
+        .unwrap()
+        .unwrap();
+        let _dispatch = scheduler
+            .acquire(identity, 100, std::slice::from_ref(&target), None)
+            .await
+            .unwrap();
+
+        let epoch = scheduler.begin_observation(std::slice::from_ref(&target));
+        scheduler.apply_observations(
+            epoch,
+            [BackendObservation {
+                target_id: target.id.clone(),
+                base_url: target.base_url.clone(),
+                dp_rank: target.dp_rank,
+                kv_cache_usage: Some(0.3),
+                running_requests: Some(1),
+                waiting_requests: Some(0),
+                observed_at: Instant::now(),
+            }],
+        );
+
+        let state = scheduler.state.lock();
+        assert_eq!(
+            scheduler.target_usage(&state, "rank-0", Instant::now()),
+            356.0
+        );
+        drop(state);
+
+        let epoch = scheduler.begin_observation(std::slice::from_ref(&target));
+        scheduler.apply_observations(
+            epoch,
+            [BackendObservation {
+                target_id: target.id.clone(),
+                base_url: target.base_url.clone(),
+                dp_rank: target.dp_rank,
+                kv_cache_usage: Some(0.4),
+                running_requests: Some(1),
+                waiting_requests: Some(0),
+                observed_at: Instant::now(),
+            }],
+        );
+
+        let state = scheduler.state.lock();
+        assert_eq!(
+            scheduler.target_usage(&state, "rank-0", Instant::now()),
+            400.0
         );
     }
 

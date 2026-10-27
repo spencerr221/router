@@ -240,10 +240,9 @@ Report absolute and relative results for job completion time, request throughput
 
 Progress-TTL currently protects KV indirectly by controlling request admission. Physical eviction, offload, and prefetch are not executed by this feature. A future Router-to-engine KV hint must receive explicit `accepted`, `rejected`, or `unsupported` feedback and an eventual `applied`, `failed`, or `expired` result. Router residency accounting must not change until the engine reports `applied`.
 
-## Workflow prediction shadow profiles
+## Workflow prediction profiles
 
-Program scheduling can collect two independent shadow signals without changing
-TTL, pause ordering, or admission:
+Program scheduling can collect two independent workflow signals:
 
 - Return-time prediction conditions completion-to-next-arrival intervals on
   stable workflow identity. Explicit terminal completions contribute
@@ -256,7 +255,7 @@ TTL, pause ordering, or admission:
 Requests may supply `workflow_profile_id` and `profile_version` inside
 `vllm_xargs.agentic_context`. These values select a compatible offline seed;
 they are never metric labels. Both predictors always maintain a bounded online
-overlay when `prediction_profile.mode` is `shadow`.
+overlay when `prediction_profile.mode` is `shadow` or `active`.
 
 ```json
 {
@@ -293,8 +292,11 @@ snapshot uses the same schema, so an operator may validate and promote it as a
 future offline seed. File serialization and replacement occur outside the
 scheduler mutex.
 
-In V0, `off` and `shadow` are the only modes. Shadow predictions are visible in
-structured logs, `/scheduling_diagnostics`, and bounded-cardinality metrics,
-but real decisions continue to use the existing rank-level fitted TTL and
-`decode_buffer_tokens` fallback. Activation requires a separate rollout after
-calibration has been evaluated.
+`off` disables collection and prediction. `shadow` exposes predictions in
+structured logs, `/scheduling_diagnostics`, and bounded-cardinality metrics
+without changing decisions. `active` uses a mature output-length prediction as
+the current request's KV-capacity reservation. An explicit
+`expected_output_length` remains authoritative, and unavailable or immature
+predictions fall back to `decode_buffer_tokens`. Active mode requires
+`token_capacity_per_dp_rank`. Return-time prediction remains observational and
+does not replace the fitted TTL.
