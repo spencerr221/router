@@ -45,6 +45,45 @@ impl ProgramScheduler {
         self.schedule_waiting(state, now);
     }
 
+    /// Record monotonic token-ID progress for one current request attempt.
+    pub fn observe_generation_progress(&self, dispatch: &ProgramDispatch, generated_tokens: usize) {
+        if !self
+            .config
+            .progress_ttl
+            .prediction_remaining_output_reservation
+        {
+            return;
+        }
+        let mut state = self.state.lock();
+        let Some(runtime) = state.runtime.view(dispatch.program()) else {
+            return;
+        };
+        if runtime.placement.as_deref() != Some(dispatch.target_id.as_str())
+            || runtime.in_flight_requests == 0
+        {
+            return;
+        }
+        let Some(decision) = state.decisions.get_mut(dispatch.program()) else {
+            return;
+        };
+        let before = decision.accounted_private_tokens(
+            self.config.progress_ttl.decode_buffer_tokens,
+            self.config
+                .prediction_profile
+                .output_reservation_admission_mode,
+        );
+        if !decision.observe_generation_progress(dispatch.request_id(), generated_tokens) {
+            return;
+        }
+        let after = decision.accounted_private_tokens(
+            self.config.progress_ttl.decode_buffer_tokens,
+            self.config
+                .prediction_profile
+                .output_reservation_admission_mode,
+        );
+        Self::adjust_usage(&mut state, &dispatch.target_id, after - before);
+    }
+
     /// Record one backend completion and run the same follow-up decisions as a tick.
     pub fn complete(
         &self,
@@ -367,6 +406,7 @@ impl ProgramScheduler {
                     "Program scheduling diagnostic"
                 );
             }
+            decision.finish_request_progress(dispatch.request_id());
             decision.output_token_reservation = if self.config.pd_mode {
                 next_output_reservation
             } else {
@@ -833,6 +873,7 @@ impl ProgramScheduler {
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
+    use crate::config::types::OutputReservationAdmissionMode;
     use crate::program_scheduling::{ProgramIdentity, ProgramSchedulerConfig, ProgramTarget};
     use serde_json::json;
     use std::time::Duration;
@@ -842,6 +883,21 @@ mod tests {
             None,
             Some(&json!({"vllm_xargs":{"agentic_context":{
                 "program_id":name,"task_id":null,"expected_resume":true
+            }}})),
+            Some("model"),
+        )
+        .unwrap()
+        .unwrap()
+    }
+
+    fn identity_with_output(name: &str, output_tokens: usize) -> ProgramIdentity {
+        ProgramIdentity::from_request(
+            None,
+            Some(&json!({"vllm_xargs":{"agentic_context":{
+                "program_id":name,
+                "task_id":null,
+                "expected_resume":true,
+                "expected_output_length":output_tokens
             }}})),
             Some("model"),
         )
@@ -1193,5 +1249,49 @@ mod tests {
         let state = scheduler.state.lock();
         assert_eq!(state.observations["rank-0"].active_program_token_delta, 0.0);
         assert!(!state.decisions.contains_key(dispatch.program()));
+    }
+
+    #[tokio::test]
+    async fn token_id_progress_is_monotonic_and_request_fenced() {
+        let mut config = ProgramSchedulerConfig::default();
+        config.progress_ttl.prediction_remaining_output_reservation = true;
+        config.prediction_profile.output_reservation_admission_mode =
+            OutputReservationAdmissionMode::ContinuousGrowth;
+        let scheduler = ProgramScheduler::new(config);
+        let target = ProgramTarget {
+            id: "rank-0".into(),
+            base_url: "http://rank-0".into(),
+            dp_rank: Some(0),
+        };
+        let dispatch = scheduler
+            .acquire(
+                identity_with_output("progress", 1_000),
+                100,
+                &[target],
+                None,
+            )
+            .await
+            .unwrap();
+
+        scheduler.observe_generation_progress(&dispatch, 64);
+        scheduler.observe_generation_progress(&dispatch, 32);
+        scheduler.observe_generation_progress(&dispatch, 128);
+        {
+            let state = scheduler.state.lock();
+            let decision = &state.decisions[dispatch.program()];
+            assert_eq!(decision.current_request_generated_tokens, 128);
+            assert!(decision.output_progress_observed);
+            assert_eq!(
+                decision.remaining_predicted_output_tokens(100, true),
+                Some(872)
+            );
+        }
+
+        scheduler.complete(&dispatch, true, false, Some(100), Some(0.1));
+        scheduler.observe_generation_progress(&dispatch, 256);
+        let state = scheduler.state.lock();
+        let decision = &state.decisions[dispatch.program()];
+        assert_eq!(decision.current_request_id, None);
+        assert_eq!(decision.current_request_generated_tokens, 0);
     }
 }

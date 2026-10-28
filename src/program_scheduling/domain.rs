@@ -85,6 +85,7 @@ pub struct ProgramTarget {
 pub struct ProgramDispatch {
     attempt_id: u64,
     program: ProgramRef,
+    request_id: u64,
     /// Target selected by the accepted admission or resume transition.
     pub target_id: String,
     placement_epoch: u64,
@@ -104,6 +105,7 @@ impl ProgramDispatch {
     pub(crate) fn new(
         attempt_id: u64,
         program: ProgramRef,
+        request_id: u64,
         target_id: String,
         placement_epoch: u64,
         request_arrived_at: Instant,
@@ -116,6 +118,7 @@ impl ProgramDispatch {
         Self {
             attempt_id,
             program,
+            request_id,
             target_id,
             placement_epoch,
             request_arrived_at,
@@ -146,6 +149,11 @@ impl ProgramDispatch {
     /// Exact Program generation associated with this request attempt.
     pub fn program(&self) -> &ProgramRef {
         &self.program
+    }
+
+    /// Router-internal request attempt identifier.
+    pub(crate) fn request_id(&self) -> u64 {
+        self.request_id
     }
 
     /// Placement epoch used to reject stale completion bookkeeping.
