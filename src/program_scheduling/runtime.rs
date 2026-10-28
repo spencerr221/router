@@ -115,6 +115,7 @@ impl ProgramRuntime {
         self.request_pool.notify_front(&program.reference);
         Some(ProgramDispatch::new(
             program.reference.clone(),
+            request.id,
             target_id,
             program.placement_epoch,
             request.arrived_at,

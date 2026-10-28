@@ -120,6 +120,11 @@ impl From<&crate::config::types::ProgramSchedulingConfig> for ProgramSchedulerCo
                 max_segment_rounds: config.max_segment_rounds,
                 stats_window_size: config.stats_window_size,
                 enable_batch_gain_admission: config.enable_batch_gain_admission,
+                prediction_remaining_output_reservation: config
+                    .prediction_remaining_output_reservation,
+                prediction_one_sided_growth_reservation: config
+                    .prediction_one_sided_growth_reservation,
+                prediction_shortest_output_first: config.prediction_shortest_output_first,
                 prefill: config.prefill_cost_model,
                 decode: config.decode_throughput_model,
             },
@@ -171,6 +176,9 @@ pub(crate) struct ProgramDecisionState {
     pub(crate) estimated_context_tokens: usize,
     pub(crate) output_token_reservation: Option<usize>,
     pub(crate) output_token_reservation_source: Option<OutputReservationSource>,
+    pub(crate) current_request_id: Option<u64>,
+    pub(crate) current_request_generated_tokens: usize,
+    pub(crate) output_progress_observed: bool,
     pub(crate) context_shrink_observations: u8,
     pub(crate) completed_requests: usize,
     pub(crate) segment_served_rounds: usize,
@@ -232,6 +240,9 @@ impl ProgramDecisionState {
             estimated_context_tokens,
             output_token_reservation: None,
             output_token_reservation_source: None,
+            current_request_id: None,
+            current_request_generated_tokens: 0,
+            output_progress_observed: false,
             context_shrink_observations: 0,
             completed_requests: 0,
             segment_served_rounds: 0,
@@ -278,9 +289,10 @@ impl ProgramDecisionState {
     ) -> f64 {
         match admission_mode {
             OutputReservationAdmissionMode::Hard => self.private_tokens(decode_buffer_tokens),
-            OutputReservationAdmissionMode::ContinuousGrowth => {
-                self.private_tokens_with_output(decode_buffer_tokens, Some(decode_buffer_tokens))
-            }
+            OutputReservationAdmissionMode::ContinuousGrowth => self
+                .private_context_tokens()
+                .saturating_add(decode_buffer_tokens.max(self.current_request_generated_tokens))
+                as f64,
         }
     }
 
@@ -302,6 +314,53 @@ impl ProgramDecisionState {
     pub(crate) fn effective_output_reservation(&self, decode_buffer_tokens: usize) -> usize {
         self.output_token_reservation
             .unwrap_or(decode_buffer_tokens)
+    }
+
+    pub(crate) fn begin_request_progress(&mut self, request_id: u64) {
+        self.current_request_id = Some(request_id);
+        self.current_request_generated_tokens = 0;
+        self.output_progress_observed = false;
+    }
+
+    pub(crate) fn observe_generation_progress(
+        &mut self,
+        request_id: u64,
+        generated_tokens: usize,
+    ) -> bool {
+        if self.current_request_id != Some(request_id)
+            || generated_tokens <= self.current_request_generated_tokens
+        {
+            return false;
+        }
+        self.current_request_generated_tokens = generated_tokens;
+        self.output_progress_observed = true;
+        true
+    }
+
+    pub(crate) fn finish_request_progress(&mut self, request_id: u64) {
+        if self.current_request_id == Some(request_id) {
+            self.current_request_id = None;
+            self.current_request_generated_tokens = 0;
+            self.output_progress_observed = false;
+        }
+    }
+
+    pub(crate) fn remaining_predicted_output_tokens(
+        &self,
+        decode_buffer_tokens: usize,
+        backend_usage_includes_generated: bool,
+    ) -> Option<usize> {
+        if !self.output_progress_observed {
+            return None;
+        }
+        let reservation = self.output_token_reservation?;
+        let accounted_generated = if backend_usage_includes_generated {
+            self.current_request_generated_tokens
+        } else {
+            self.current_request_generated_tokens
+                .max(decode_buffer_tokens)
+        };
+        Some(reservation.saturating_sub(accounted_generated))
     }
 
     pub(crate) fn private_tokens_with_output(

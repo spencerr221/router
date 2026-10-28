@@ -36,6 +36,9 @@ pub struct ProgramDiagnostic {
     pub expected_output_tokens: Option<usize>,
     pub output_reservation_tokens: usize,
     pub output_reservation_source: &'static str,
+    pub current_request_generated_tokens: usize,
+    pub remaining_predicted_output_tokens: Option<usize>,
+    pub output_progress_observed: bool,
     pub kv_retention_ttl_seconds: Option<f64>,
     pub home_target: Option<String>,
     pub last_target: Option<String>,
@@ -276,6 +279,11 @@ impl ProgramScheduler {
                     output_reservation_source: decision
                         .output_token_reservation_source
                         .map_or("default", |source| source.as_str()),
+                    current_request_generated_tokens: decision.current_request_generated_tokens,
+                    remaining_predicted_output_tokens: decision.output_token_reservation.map(
+                        |tokens| tokens.saturating_sub(decision.current_request_generated_tokens),
+                    ),
+                    output_progress_observed: decision.output_progress_observed,
                     kv_retention_ttl_seconds: request_hints
                         .and_then(|hints| hints.kv_retention_ttl)
                         .map(|ttl| ttl.as_secs_f64()),

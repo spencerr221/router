@@ -59,7 +59,14 @@ impl ProgramCompletion {
         if !chunk.is_empty() {
             let _ = self.inner.first_stream_output_at.set(Instant::now());
         }
-        self.inner.usage.lock().observe_sse_chunk(chunk);
+        let generated_tokens = {
+            let mut usage = self.inner.usage.lock();
+            usage.observe_sse_chunk(chunk);
+            usage.generated_token_ids
+        };
+        self.inner
+            .scheduler
+            .observe_generation_progress(&self.inner.dispatch, generated_tokens);
     }
 
     pub(super) fn finish(&self, success: bool) {
@@ -101,6 +108,7 @@ impl Drop for ProgramCompletionInner {
 struct ProgramUsageAccumulator {
     observation: ProgramUsageObservation,
     sse_buffer: Vec<u8>,
+    generated_token_ids: usize,
 }
 
 impl ProgramUsageAccumulator {
@@ -148,12 +156,22 @@ impl ProgramUsageAccumulator {
         if data
             .windows(b"\"usage\"".len())
             .any(|window| window == b"\"usage\"")
+            || data
+                .windows(b"\"token_ids\"".len())
+                .any(|window| window == b"\"token_ids\"")
         {
             self.observe_json(data);
         }
     }
 
     fn observe_value(&mut self, value: &serde_json::Value) {
+        if let Some(token_ids) = value
+            .pointer("/choices/0/token_ids")
+            .and_then(serde_json::Value::as_array)
+            .filter(|values| values.iter().all(serde_json::Value::is_u64))
+        {
+            self.generated_token_ids = self.generated_token_ids.saturating_add(token_ids.len());
+        }
         for usage in [
             value.get("usage"),
             value.pointer("/message/usage"),
@@ -243,6 +261,10 @@ mod tests {
         accumulator.observe_sse_chunk(b"\"completion_tokens\":3}}\n\ndata: [DONE]\n");
         assert_eq!(accumulator.observation.prompt_tokens, Some(12));
         assert_eq!(accumulator.observation.completion_tokens, Some(3));
+
+        accumulator.observe_sse_chunk(b"data: {\"choices\":[{\"token_ids\":[1,2");
+        accumulator.observe_sse_chunk(b",3]}]}\n");
+        assert_eq!(accumulator.generated_token_ids, 3);
     }
 
     #[tokio::test]

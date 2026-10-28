@@ -369,6 +369,9 @@ impl ProgramScheduler {
         let mut state = self.state.lock();
         let target = state.runtime.placement(handle.program())?.to_string();
         let dispatch = state.runtime.admit_front(handle, target, Instant::now())?;
+        if let Some(decision) = state.decisions.get_mut(dispatch.program()) {
+            decision.begin_request_progress(dispatch.request_id());
+        }
         RouterMetrics::record_agent_aware_queue_wait(
             &dispatch.target_id,
             dispatch
@@ -513,6 +516,7 @@ impl ProgramScheduler {
     ) -> Ordering {
         self.resume_tier_cmp(state, left, right, now)
             .then_with(|| self.segment_yield_cmp(state, left, right))
+            .then_with(|| self.predicted_output_cmp(state, left, right))
             .then_with(|| self.ordinary_resume_cmp(state, left, right))
     }
 
@@ -530,6 +534,7 @@ impl ProgramScheduler {
         queued.sort_by(|left, right| {
             self.resume_tier_cmp(state, left, right, now)
                 .then_with(|| self.segment_yield_cmp(state, left, right))
+                .then_with(|| self.predicted_output_cmp(state, left, right))
                 .then_with(|| self.ordinary_resume_cmp(state, left, right))
         });
     }
@@ -586,6 +591,24 @@ impl ProgramScheduler {
             state.decisions[program].last_pause_reason == Some(ProgramPauseReason::MaxSegmentYield)
         };
         yielded(left).cmp(&yielded(right))
+    }
+
+    fn predicted_output_cmp(
+        &self,
+        state: &ProgramSchedulerState,
+        left: &ProgramRef,
+        right: &ProgramRef,
+    ) -> Ordering {
+        if !self.config.progress_ttl.prediction_shortest_output_first {
+            return Ordering::Equal;
+        }
+        match (
+            state.decisions[left].output_token_reservation,
+            state.decisions[right].output_token_reservation,
+        ) {
+            (Some(left), Some(right)) => left.cmp(&right),
+            _ => Ordering::Equal,
+        }
     }
 
     fn ordinary_resume_cmp(
@@ -689,17 +712,33 @@ impl ProgramScheduler {
                 .output_reservation_admission_mode,
         );
         let factors = state.rank_factors.get(target_id);
+        let backend_usage_includes_generated =
+            self.observed_target_usage(state, target_id, now).is_some();
         let reserve_tokens = factors.map_or(candidate_growth_reserve.unwrap_or(0.0), |factors| {
             let target_rounds = self.policy.target_rounds(factors);
-            let active_remaining = active.iter().filter_map(|active| {
+            let active_growth = active.iter().filter_map(|active| {
                 state.decisions.get(active.reference).map(|active_state| {
-                    (target_rounds - active_state.rounds_since_activation as f64).max(0.0)
+                    let remaining_rounds =
+                        (target_rounds - active_state.rounds_since_activation as f64).max(0.0);
+                    let predicted = self
+                        .config
+                        .progress_ttl
+                        .prediction_remaining_output_reservation
+                        .then(|| {
+                            active_state.remaining_predicted_output_tokens(
+                                self.config.progress_ttl.decode_buffer_tokens,
+                                backend_usage_includes_generated,
+                            )
+                        })
+                        .flatten()
+                        .map(|tokens| tokens as f64);
+                    (predicted, remaining_rounds)
                 })
             });
             self.policy.continuous_growth_reserve_tokens(
                 factors,
                 candidate_growth_reserve,
-                active_remaining,
+                active_growth,
             )
         });
         let reserve_fits = used_tokens + required_tokens + reserve_tokens <= low;
@@ -1482,6 +1521,46 @@ mod tests {
         let mut ordered = refs.clone();
         ordered.sort_by(|left, right| scheduler.local_resume_cmp(&state, left, right, now));
         assert_eq!(ordered, vec![refs[1].clone(), refs[0].clone()]);
+    }
+
+    #[test]
+    fn shortest_predicted_output_precedes_mru_but_not_force_resume() {
+        let mut config = ProgramSchedulerConfig::default();
+        config.progress_ttl.prediction_shortest_output_first = true;
+        let scheduler = ProgramScheduler::new(config);
+        scheduler.sync_targets("model", &[target()]);
+        let now = Instant::now();
+        let mut state = scheduler.state.lock();
+        let mut refs = Vec::new();
+        for (index, name) in ["long", "short", "forced-long"].into_iter().enumerate() {
+            let identity = identity(name);
+            let handle = state.runtime.retain_request(&identity, 100, None, now);
+            let reference = handle.program().clone();
+            scheduler.ensure_decision_state(
+                &mut state,
+                &identity,
+                reference.clone(),
+                100,
+                now,
+                None,
+            );
+            let decision = state.decisions.get_mut(&reference).unwrap();
+            decision.last_request_finished_at = Some(now - Duration::from_secs((index + 1) as u64));
+            decision.output_token_reservation = Some(if name == "short" { 512 } else { 8_000 });
+            refs.push(reference);
+        }
+        state
+            .decisions
+            .get_mut(&refs[2])
+            .unwrap()
+            .force_resume_deadline = Some(now);
+
+        let mut ordered = refs.clone();
+        scheduler.order_resume_candidates(&state, &mut ordered, now);
+        assert_eq!(
+            ordered,
+            vec![refs[2].clone(), refs[1].clone(), refs[0].clone()]
+        );
     }
 
     #[test]

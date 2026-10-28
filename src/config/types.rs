@@ -269,6 +269,15 @@ pub struct ProgramSchedulingConfig {
     pub stats_window_size: usize,
     #[serde(default = "default_program_enable_batch_gain_admission")]
     pub enable_batch_gain_admission: bool,
+    /// Replace historical active growth with observed remaining predicted output.
+    #[serde(default)]
+    pub prediction_remaining_output_reservation: bool,
+    /// Let trustworthy predictions reduce, but never increase, historical growth reserve.
+    #[serde(default)]
+    pub prediction_one_sided_growth_reservation: bool,
+    /// Prefer shorter predicted outputs within the same local fairness tier.
+    #[serde(default)]
+    pub prediction_shortest_output_first: bool,
     /// Offline-seeded, online-updated workflow prediction.
     #[serde(default)]
     pub prediction_profile: PredictionProfileConfig,
@@ -389,6 +398,9 @@ impl Default for ProgramSchedulingConfig {
             max_segment_rounds: default_program_max_segment_rounds(),
             stats_window_size: default_program_stats_window_size(),
             enable_batch_gain_admission: default_program_enable_batch_gain_admission(),
+            prediction_remaining_output_reservation: false,
+            prediction_one_sided_growth_reservation: false,
+            prediction_shortest_output_first: false,
             prediction_profile: PredictionProfileConfig::default(),
             prefill_cost_model: PrefillCostModel::default(),
             decode_throughput_model: DecodeThroughputModel::default(),
@@ -449,6 +461,12 @@ struct ProgramSchedulingConfigInput {
     stats_window_size: usize,
     #[serde(default = "default_program_enable_batch_gain_admission")]
     enable_batch_gain_admission: bool,
+    #[serde(default)]
+    prediction_remaining_output_reservation: bool,
+    #[serde(default)]
+    prediction_one_sided_growth_reservation: bool,
+    #[serde(default)]
+    prediction_shortest_output_first: bool,
     #[serde(default)]
     prediction_profile: PredictionProfileConfig,
     #[serde(default)]
@@ -560,6 +578,9 @@ impl<'de> Deserialize<'de> for ProgramSchedulingConfig {
             max_segment_rounds: input.max_segment_rounds,
             stats_window_size: input.stats_window_size,
             enable_batch_gain_admission: input.enable_batch_gain_admission,
+            prediction_remaining_output_reservation: input.prediction_remaining_output_reservation,
+            prediction_one_sided_growth_reservation: input.prediction_one_sided_growth_reservation,
+            prediction_shortest_output_first: input.prediction_shortest_output_first,
             prediction_profile: input.prediction_profile,
             prefill_cost_model,
             decode_throughput_model,
@@ -1297,6 +1318,18 @@ mod tests {
             scaled.prediction_profile.output_reservation_admission_mode,
             OutputReservationAdmissionMode::ContinuousGrowth
         );
+
+        let soft_reserve: ProgramSchedulingConfig = serde_json::from_str(
+            r#"{
+                "prediction_remaining_output_reservation": true,
+                "prediction_one_sided_growth_reservation": true,
+                "prediction_shortest_output_first": true
+            }"#,
+        )
+        .unwrap();
+        assert!(soft_reserve.prediction_remaining_output_reservation);
+        assert!(soft_reserve.prediction_one_sided_growth_reservation);
+        assert!(soft_reserve.prediction_shortest_output_first);
     }
 
     #[test]
