@@ -37,6 +37,7 @@ pub use domain::{
 };
 pub use factors::{ContinuitySample, ProgressTtlFactors, RequestSample};
 pub use identity::{ProgramIdentity, ProgramRequestHints, ProgramSchedulingEnableKey};
+pub(crate) use observations::max_prometheus_gauge;
 pub use observations::{
     BackendObservation, BackendObservationFailure, BackendObservationProvider,
     VllmMetricsObservationProvider,

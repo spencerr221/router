@@ -2,7 +2,7 @@ use clap::{ArgAction, Parser, ValueEnum};
 use std::collections::HashMap;
 use vllm_router_rs::config::{
     CircuitBreakerConfig, ConfigError, ConfigResult, ConnectionMode, DiscoveryConfig,
-    HealthCheckConfig, HistoryBackend, KvConnector, MetricsConfig, PolicyConfig,
+    HealthCheckConfig, HistoryBackend, KvConnector, MetricsConfig, PdKvEventSources, PolicyConfig,
     ProgramSchedulingConfig, RetryConfig, RouterConfig, RoutingMode, TraceConfig,
 };
 use vllm_router_rs::metrics::PrometheusConfig;
@@ -119,8 +119,8 @@ struct CliArgs {
     #[arg(long, num_args = 0..)]
     worker_urls: Vec<String>,
 
-    /// Load balancing policy to use
-    #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "consistent_hash", "rendezvous_hash"])]
+    /// Load balancing policy to use. kv_aware uses stage-specific load profiles in PD mode.
+    #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "cache_aware", "kv_aware", "power_of_two", "consistent_hash", "rendezvous_hash"])]
     policy: String,
 
     /// Enable Program-level scheduling independently of the request-level
@@ -146,12 +146,24 @@ struct CliArgs {
     #[arg(long, action = ArgAction::Append)]
     decode: Vec<String>,
 
-    /// Specific policy for prefill nodes in PD mode
-    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "consistent_hash", "rendezvous_hash"])]
+    /// Statically configured KV event sources as
+    /// "PREFILL_URL=ZMQ_PUB_ENDPOINT[,ENDPOINT...]"; the Nth endpoint is DP
+    /// rank N. Can be specified multiple times, once per prefill worker.
+    /// Replay endpoints, block size, and model are only configurable via the
+    /// YAML/JSON config file.
+    #[arg(
+        long = "pd-kv-events",
+        action = ArgAction::Append,
+        value_name = "URL=ENDPOINT[,ENDPOINT...]"
+    )]
+    pd_kv_events: Vec<String>,
+
+    /// Specific policy for prefill nodes in PD mode. kv_aware uses the prefill load profile.
+    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "kv_aware", "power_of_two", "consistent_hash", "rendezvous_hash"])]
     prefill_policy: Option<String>,
 
-    /// Specific policy for decode nodes in PD mode
-    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "consistent_hash", "rendezvous_hash"])]
+    /// Specific policy for decode nodes in PD mode (defaults to --policy).
+    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "kv_aware", "power_of_two", "consistent_hash", "rendezvous_hash"])]
     decode_policy: Option<String>,
 
     /// Timeout in seconds for worker startup
@@ -178,9 +190,38 @@ struct CliArgs {
     #[arg(long, default_value_t = 120)]
     eviction_interval: u64,
 
-    /// Maximum size of the approximation tree for cache-aware routing
-    #[arg(long, default_value_t = 67108864)] // 2^26
+    /// Per-worker character budget in each model tree (enforced at cache eviction)
+    #[arg(long, default_value_t = 1 << 25)]
     max_tree_size: usize,
+
+    /// Softmax temperature for kv_aware (0 selects the minimum cost).
+    #[arg(long, default_value_t = 0.0)]
+    router_temperature: f64,
+
+    /// Enable kv_aware session affinity and set its idle TTL in seconds.
+    /// P/D uses decode-only soft affinity based on pending plus active requests.
+    /// Omit to disable session affinity while keeping KV-aware routing enabled.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..=31_536_000))]
+    kv_aware_session_affinity_ttl_secs: Option<u64>,
+    /// Static KV event publishers for regular kv_aware workers.
+    #[arg(long = "kv-event-source", action = ArgAction::Append, value_name = "WORKER_URL=ENDPOINT[,ENDPOINT...]")]
+    kv_event_source: Vec<String>,
+    /// Optional ZMQ replay endpoints, one per DP rank, keyed by worker URL.
+    #[arg(long = "kv-event-replay-source", action = ArgAction::Append, value_name = "WORKER_URL=ENDPOINT[,ENDPOINT...]")]
+    kv_event_replay_source: Vec<String>,
+    /// KV cache block size for static event publishers.
+    #[arg(long, default_value_t = 16)]
+    kv_event_block_size: u32,
+    /// Shared model identity for workers using static event publishers.
+    #[arg(long)]
+    kv_event_model: Option<String>,
+    /// Transfer credit for host-resident KV blocks.
+    #[arg(long, default_value_t = 0.8)]
+    kv_penalty_host: f64,
+    #[arg(long, default_value_t = 0.6)]
+    kv_penalty_external: f64,
+    #[arg(long, default_value_t = 0.3)]
+    kv_penalty_disk: f64,
 
     /// Maximum payload size in bytes
     #[arg(long, default_value_t = 536870912)] // 512MB
@@ -408,6 +449,13 @@ impl CliArgs {
                 eviction_interval_secs: self.eviction_interval,
                 max_tree_size: self.max_tree_size,
             },
+            "kv_aware" => PolicyConfig::KvAware {
+                router_temperature: self.router_temperature,
+                kv_penalty_host: self.kv_penalty_host,
+                kv_penalty_external: self.kv_penalty_external,
+                kv_penalty_disk: self.kv_penalty_disk,
+                static_kv_event_sources: Box::default(),
+            },
             "power_of_two" => PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 5, // Default value
             },
@@ -419,11 +467,21 @@ impl CliArgs {
         }
     }
 
+    fn parse_pd_kv_events(specs: &[String]) -> ConfigResult<HashMap<String, PdKvEventSources>> {
+        vllm_router_rs::config::parse_pd_kv_events(specs)
+    }
+
     /// Convert CLI arguments to RouterConfig
     fn to_router_config(
         &self,
         prefill_urls: Vec<(String, Option<u16>)>,
     ) -> ConfigResult<RouterConfig> {
+        let static_kv_event_sources = vllm_router_rs::config::parse_static_kv_event_sources(
+            &self.kv_event_source,
+            &self.kv_event_replay_source,
+            self.kv_event_block_size,
+            self.kv_event_model.as_deref(),
+        )?;
         // Determine routing mode
         let mode = if self.enable_igw {
             // IGW mode - routing mode is not used in IGW, but we need to provide a placeholder
@@ -503,7 +561,18 @@ impl CliArgs {
         };
 
         // Main policy
-        let policy = self.parse_policy(&self.policy);
+        let mut policy = self.parse_policy(&self.policy);
+        if let PolicyConfig::KvAware {
+            static_kv_event_sources: configured,
+            ..
+        } = &mut policy
+        {
+            **configured = static_kv_event_sources;
+        } else if !static_kv_event_sources.is_empty() {
+            return Err(ConfigError::IncompatibleConfig {
+                reason: "--kv-event-source requires --policy kv_aware in regular mode".to_string(),
+            });
+        }
 
         // Service discovery configuration
         let discovery = if self.service_discovery {
@@ -546,6 +615,8 @@ impl CliArgs {
             self.program_scheduling_config_json.as_deref(),
         )?;
 
+        let pd_kv_event_sources = Self::parse_pd_kv_events(&self.pd_kv_events)?;
+
         // Build RouterConfig
         Ok(RouterConfig {
             epd: self
@@ -557,6 +628,7 @@ impl CliArgs {
                     reason: format!("Invalid --epd-config: {e}"),
                 })?,
             mode,
+            pd_kv_event_sources,
             policy,
             connection_mode,
             host: self.host.clone(),
@@ -596,6 +668,7 @@ impl CliArgs {
             },
             disable_retries: self.disable_retries,
             disable_circuit_breaker: self.disable_circuit_breaker,
+            kv_aware_session_affinity_ttl_secs: self.kv_aware_session_affinity_ttl_secs,
             health_check: HealthCheckConfig {
                 failure_threshold: self.health_failure_threshold,
                 success_threshold: self.health_success_threshold,
@@ -773,9 +846,26 @@ Provide --worker-urls or PD flags as usual.",
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_pd_kv_aware_with_affinity_ttl() {
+        let args = CliArgs::try_parse_from([
+            "vllm-router",
+            "--prefill-policy",
+            "kv_aware",
+            "--decode-policy",
+            "kv_aware",
+            "--kv-aware-session-affinity-ttl-secs",
+            "1800",
+        ])
+        .unwrap();
+        assert_eq!(args.prefill_policy.as_deref(), Some("kv_aware"));
+        assert_eq!(args.decode_policy.as_deref(), Some("kv_aware"));
+        assert_eq!(args.kv_aware_session_affinity_ttl_secs, Some(1800));
+    }
 
     #[test]
     fn parses_wasm_middleware_options() {
@@ -860,5 +950,36 @@ mod tests {
 
         assert_eq!(prefill, vec![("http://prefill:8000".to_string(), None)]);
         assert_eq!(other, ["vllm-router", "65536"]);
+    }
+
+    #[test]
+    fn parses_pd_kv_events_specs() {
+        let specs = [
+            "http://prefill:8000=tcp://prefill:5557".to_string(),
+            "http://prefill2:8000=tcp://prefill2:5557, tcp://prefill2:5559".to_string(),
+        ]
+        .to_vec();
+        let sources = CliArgs::parse_pd_kv_events(&specs).unwrap();
+        assert_eq!(sources.len(), 2);
+        assert_eq!(
+            sources["http://prefill:8000"].endpoints,
+            vec!["tcp://prefill:5557".to_string()]
+        );
+        assert_eq!(sources["http://prefill:8000"].block_size, 16);
+        // The space after ',' is intentional: exercises endpoint trimming.
+        assert_eq!(
+            sources["http://prefill2:8000"].endpoints,
+            vec![
+                "tcp://prefill2:5557".to_string(),
+                "tcp://prefill2:5559".to_string()
+            ]
+        );
+
+        for bad in ["no-endpoint", "http://p:8000=", "=tcp://p:5557"] {
+            assert!(
+                CliArgs::parse_pd_kv_events(&[bad.to_string()]).is_err(),
+                "should reject '{bad}'"
+            );
+        }
     }
 }
