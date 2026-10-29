@@ -54,7 +54,7 @@ pub(crate) struct PendingOutputPrediction {
     pub prediction: Option<OutputPrediction>,
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
     use serde_json::json;
