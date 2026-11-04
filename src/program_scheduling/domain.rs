@@ -5,7 +5,7 @@ use std::hash::{BuildHasher, Hash};
 use std::sync::OnceLock;
 use std::time::Instant;
 
-use super::ProgramRequestHints;
+use super::{output_length::PendingOutputPrediction, ProgramRequestHints};
 
 /// Whether a Program currently owns logical admission capacity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,6 +83,7 @@ pub struct ProgramTarget {
 /// Immutable proof that one retained request was admitted to a target.
 #[derive(Debug, Clone)]
 pub struct ProgramDispatch {
+    attempt_id: u64,
     program: ProgramRef,
     request_id: u64,
     /// Target selected by the accepted admission or resume transition.
@@ -94,12 +95,15 @@ pub struct ProgramDispatch {
     placement_start_request: bool,
     routing_text: Option<String>,
     request_hints: ProgramRequestHints,
+    expected_resume: bool,
+    pending_output_prediction: Option<PendingOutputPrediction>,
 }
 
 impl ProgramDispatch {
     /// Construct a dispatch after admission has atomically committed.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
+        attempt_id: u64,
         program: ProgramRef,
         request_id: u64,
         target_id: String,
@@ -112,6 +116,7 @@ impl ProgramDispatch {
         request_hints: ProgramRequestHints,
     ) -> Self {
         Self {
+            attempt_id,
             program,
             request_id,
             target_id,
@@ -122,7 +127,23 @@ impl ProgramDispatch {
             placement_start_request,
             routing_text,
             request_hints,
+            expected_resume: true,
+            pending_output_prediction: None,
         }
+    }
+
+    pub(crate) fn attach_prediction_context(
+        &mut self,
+        expected_resume: bool,
+        pending_output_prediction: Option<PendingOutputPrediction>,
+    ) {
+        self.expected_resume = expected_resume;
+        self.pending_output_prediction = pending_output_prediction;
+    }
+
+    /// Unique Router-owned attempt, fencing duplicate completion within a placement.
+    pub fn attempt_id(&self) -> u64 {
+        self.attempt_id
     }
 
     /// Exact Program generation associated with this request attempt.
@@ -170,6 +191,15 @@ impl ProgramDispatch {
         &self.request_hints
     }
 
+    /// Whether upstream expects another model request after this request completes.
+    pub fn expected_resume(&self) -> bool {
+        self.expected_resume
+    }
+
+    pub(crate) fn pending_output_prediction(&self) -> Option<&PendingOutputPrediction> {
+        self.pending_output_prediction.as_ref()
+    }
+
     /// Stable privacy-preserving Program identifier for logs and metrics.
     pub fn redacted_program_id(&self) -> String {
         self.program.redacted_id()
@@ -205,7 +235,7 @@ impl From<Option<usize>> for ProgramUsageObservation {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
 

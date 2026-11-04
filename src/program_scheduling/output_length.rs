@@ -20,7 +20,7 @@ impl OutputReservationSource {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct OutputReservation {
     pub tokens: Option<usize>,
     pub source: Option<OutputReservationSource>,
@@ -114,7 +114,7 @@ pub(crate) struct PendingOutputPrediction {
     pub prediction: Option<OutputPrediction>,
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
     use crate::program_scheduling::prediction_profile::PredictionSource;

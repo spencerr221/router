@@ -71,7 +71,7 @@ impl ProgramScheduler {
                 .prediction_profile
                 .output_reservation_admission_mode,
         );
-        if !decision.observe_generation_progress(dispatch.request_id(), generated_tokens) {
+        if !decision.observe_generation_progress(dispatch.attempt_id(), generated_tokens) {
             return;
         }
         let after = decision.accounted_private_tokens(
@@ -92,7 +92,27 @@ impl ProgramScheduler {
         usage: impl Into<ProgramUsageObservation>,
         decode_seconds: Option<f64>,
     ) {
-        let usage = usage.into();
+        self.complete_with_pd_ttl(
+            dispatch,
+            success,
+            terminate,
+            usage.into(),
+            decode_seconds,
+            None,
+        );
+    }
+
+    /// A trusted PD adapter supplies its independently calibrated keep/drop TTL.
+    /// Capacity repair and the existing generation/placement/deadline transaction remain authoritative.
+    pub fn complete_with_pd_ttl(
+        &self,
+        dispatch: &ProgramDispatch,
+        success: bool,
+        terminate: bool,
+        usage: ProgramUsageObservation,
+        decode_seconds: Option<f64>,
+        pd_ttl: Option<std::time::Duration>,
+    ) {
         let now = Instant::now();
         let mut state = self.state.lock();
         let Some(runtime_before) = state.runtime.view(dispatch.program()) else {
@@ -141,10 +161,22 @@ impl ProgramScheduler {
                     .fitted_acting_ttl(factors, cache_miss_impact_seconds)
             })
             .unwrap_or_default();
-        let acting_ttl = dispatch
+        let mut acting_ttl = dispatch
             .request_hints()
             .kv_retention_ttl
             .unwrap_or(policy_acting_ttl);
+        if self.config.pd_mode {
+            acting_ttl = if self.config.pd_explicit_ttl {
+                pd_ttl
+                    .or(dispatch.request_hints().kv_retention_ttl)
+                    .unwrap_or_default()
+                    .min(self.config.progress_ttl.max_acting_ttl)
+            } else {
+                pd_ttl
+                    .unwrap_or_default()
+                    .min(self.config.progress_ttl.max_acting_ttl)
+            };
+        }
         let ttl_window_samples = state
             .rank_factors
             .get(&target_id)
@@ -160,6 +192,7 @@ impl ProgramScheduler {
             return;
         }
         let runtime_after = state.runtime.view(dispatch.program());
+        let next_output_reservation = self.front_output_reservation(&state, dispatch.program());
 
         // A retained successor continues the same reasoning placement. Match
         // the historical Router behavior by cancelling a deferred capacity
@@ -203,7 +236,15 @@ impl ProgramScheduler {
         }
 
         let mut request_sample = None;
-        let mut output_observation = None;
+        let actual_output_tokens = if success {
+            usage.completion_tokens
+        } else {
+            None
+        };
+        let output_observation = dispatch
+            .pending_output_prediction()
+            .cloned()
+            .zip(actual_output_tokens);
         if let Some(decision) = state.decisions.get_mut(dispatch.program()) {
             let previous_context = decision.last_context_tokens;
             let context_growth_tokens = previous_context.and_then(|previous| {
@@ -236,7 +277,11 @@ impl ProgramScheduler {
                     decision.ttl_pause_sampled_segment_rounds = 0;
                     decision.segment_started_at = Some(dispatch.dispatched_at());
                     if freshness_due {
-                        decision.shared_prefix_tokens = explicitly_observed_cache_tokens;
+                        decision.shared_prefix_tokens = if self.config.pd_mode {
+                            0
+                        } else {
+                            explicitly_observed_cache_tokens
+                        };
                         decision.shared_prefix_observed = true;
                         decision.shared_prefix_fresh_until =
                             Some(decision.shared_prefix_freshness_anchor_at + freshness);
@@ -249,11 +294,10 @@ impl ProgramScheduler {
                     }
                 }
                 let completion_tokens = usage.completion_tokens.unwrap_or(0);
-                if let (Some(actual_tokens), Some(pending)) = (
-                    usage.completion_tokens,
-                    decision.pending_output_prediction.take(),
-                ) {
-                    output_observation = Some((pending, actual_tokens));
+                if let Some(actual_tokens) = usage
+                    .completion_tokens
+                    .filter(|_| dispatch.pending_output_prediction().is_some())
+                {
                     decision.last_output_actual_tokens = Some(actual_tokens);
                 }
                 decision.completed_requests = decision.completed_requests.saturating_add(1);
@@ -358,9 +402,28 @@ impl ProgramScheduler {
                     "Program scheduling diagnostic"
                 );
             }
-            decision.finish_request_progress(dispatch.request_id());
-            decision.output_token_reservation = None;
-            decision.output_token_reservation_source = None;
+            decision.finish_request_progress(dispatch.attempt_id());
+            decision.output_token_reservation = if self.config.pd_mode {
+                next_output_reservation.tokens
+            } else {
+                None
+            };
+            decision.output_token_reservation_source = if self.config.pd_mode {
+                next_output_reservation.source
+            } else {
+                None
+            };
+        }
+        // The retained successor is now the front turn. In PD mode its
+        // request-scoped context may be smaller than the completed turn's;
+        // update it before reconciling the active reservation below.
+        if let Some(context_tokens) = state.runtime.front_request_context(dispatch.program()) {
+            if let Some(decision) = state.decisions.get_mut(dispatch.program()) {
+                if self.config.pd_mode || context_tokens > decision.estimated_context_tokens {
+                    decision.estimated_context_tokens = context_tokens;
+                    decision.context_shrink_observations = 0;
+                }
+            }
         }
         if self.config.prediction_profile.mode != PredictionMode::Off {
             if let Some((pending, actual_tokens)) = output_observation {
@@ -401,7 +464,13 @@ impl ProgramScheduler {
                 );
                 if completion_action == Some(CompletionAction::Terminate) {
                     state.prediction_profiles.observe_no_return(&keys);
-                } else if success && completion_action == Some(CompletionAction::StartActingTtl) {
+                } else if success
+                    && matches!(
+                        completion_action,
+                        Some(CompletionAction::StartActingTtl)
+                            | Some(CompletionAction::Pause(ProgramPauseReason::CapacityRepair))
+                    )
+                {
                     let prediction = state.prediction_profiles.predict_return(
                         &keys,
                         0.0,
@@ -478,6 +547,9 @@ impl ProgramScheduler {
         }
         if !self.config.binding_only {
             self.yield_completed_segment(&mut state, dispatch.program(), now);
+        }
+        if self.config.pd_mode {
+            state.runtime.notify_front(dispatch.program());
         }
         self.run_periodic_decisions(&mut state, now);
     }
@@ -797,7 +869,7 @@ impl ProgramScheduler {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
     use crate::config::types::OutputReservationAdmissionMode;
@@ -955,6 +1027,56 @@ mod tests {
             .return_time_profiles
             .iter()
             .any(|entry| entry.no_return_count >= 1.0));
+    }
+
+    #[tokio::test]
+    async fn capacity_repair_pause_preserves_return_observation() {
+        let scheduler = ProgramScheduler::new(ProgramSchedulerConfig::default());
+        let target = ProgramTarget {
+            id: "rank-0".into(),
+            base_url: "http://rank-0".into(),
+            dp_rank: Some(0),
+        };
+        let dispatch = scheduler
+            .acquire(
+                identity("capacity-pause-return"),
+                100,
+                std::slice::from_ref(&target),
+                None,
+            )
+            .await
+            .unwrap();
+        scheduler
+            .state
+            .lock()
+            .decisions
+            .get_mut(dispatch.program())
+            .unwrap()
+            .pause_when_idle = true;
+
+        scheduler.complete(&dispatch, true, false, None, None);
+        {
+            let state = scheduler.state.lock();
+            let decision = &state.decisions[dispatch.program()];
+            assert_eq!(
+                decision.last_pause_reason,
+                Some(ProgramPauseReason::CapacityRepair)
+            );
+            assert!(decision.pending_return_prediction.is_some());
+        }
+
+        scheduler
+            .acquire(
+                identity("capacity-pause-return"),
+                100,
+                std::slice::from_ref(&target),
+                None,
+            )
+            .await
+            .unwrap();
+        let state = scheduler.state.lock();
+        let (_, snapshot) = state.prediction_profiles.snapshot().unwrap();
+        assert!(!snapshot.return_time_profiles.is_empty());
     }
 
     #[tokio::test]
@@ -1131,7 +1253,9 @@ mod tests {
     #[tokio::test]
     async fn token_id_progress_is_monotonic_and_request_fenced() {
         let mut config = ProgramSchedulerConfig::default();
+        config.progress_ttl.token_capacity = Some(2_000);
         config.progress_ttl.prediction_remaining_output_reservation = true;
+        config.prediction_profile.mode = PredictionMode::Active;
         config.prediction_profile.output_reservation_admission_mode =
             OutputReservationAdmissionMode::ContinuousGrowth;
         let scheduler = ProgramScheduler::new(config);
@@ -1156,8 +1280,8 @@ mod tests {
         {
             let state = scheduler.state.lock();
             let decision = &state.decisions[dispatch.program()];
-            assert_eq!(decision.current_request_generated_tokens, 128);
-            assert!(decision.output_progress_observed);
+            assert_eq!(decision.current_request_generated_tokens(), 128);
+            assert!(decision.output_progress_observed());
             assert_eq!(
                 decision.remaining_predicted_output_tokens(100, true),
                 Some(872)
@@ -1168,7 +1292,7 @@ mod tests {
         scheduler.observe_generation_progress(&dispatch, 256);
         let state = scheduler.state.lock();
         let decision = &state.decisions[dispatch.program()];
-        assert_eq!(decision.current_request_id, None);
-        assert_eq!(decision.current_request_generated_tokens, 0);
+        assert_eq!(decision.current_request_generated_tokens(), 0);
+        assert!(!decision.output_progress_observed());
     }
 }

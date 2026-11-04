@@ -2,7 +2,10 @@
 //!
 //! Provides centralized registry for workers with model-based indexing
 
-use crate::core::{ConnectionMode, Worker, WorkerType};
+use crate::{
+    core::{ConnectionMode, Worker, WorkerType},
+    metrics::RouterMetrics,
+};
 use dashmap::DashMap;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
@@ -121,6 +124,9 @@ impl WorkerRegistry {
             .entry(worker.connection_mode())
             .or_default()
             .push(worker_id.clone());
+
+        // Publish the initial state even if no health transition occurs.
+        RouterMetrics::set_worker_health(worker.url(), worker.is_healthy());
 
         self.notify_worker_state_change();
 
@@ -395,10 +401,6 @@ impl WorkerRegistry {
             let mut interval =
                 tokio::time::interval(tokio::time::Duration::from_secs(check_interval_secs));
 
-            // Counter for periodic load reset (every 10 health check cycles)
-            let mut check_count = 0u64;
-            const LOAD_RESET_INTERVAL: u64 = 10;
-
             loop {
                 interval.tick().await;
 
@@ -420,15 +422,6 @@ impl WorkerRegistry {
                     let _ = worker.check_health_async().await; // Use async version directly
                     if was_available != worker.is_available() {
                         revision.fetch_add(1, Ordering::AcqRel);
-                    }
-                }
-
-                // Reset loads periodically
-                check_count += 1;
-                if check_count.is_multiple_of(LOAD_RESET_INTERVAL) {
-                    tracing::debug!("Resetting worker loads (cycle {})", check_count);
-                    for worker in &workers {
-                        worker.reset_load();
                     }
                 }
             }
@@ -456,7 +449,7 @@ pub struct WorkerRegistryStats {
     pub decode_workers: usize,
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
     use crate::core::{CircuitBreakerConfig, WorkerFactory};

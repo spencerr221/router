@@ -31,6 +31,17 @@ pub enum ProgramResumeOrder {
 /// Complete opt-in Program scheduler configuration.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProgramSchedulerConfig {
+    /// PD enforces serial turns and immediate capacity even after force timeout.
+    pub pd_mode: bool,
+    pub pd_explicit_ttl: bool,
+    /// PD treats native occupancy and Program reservations as overlapping KV.
+    pub pd_exclusive_capacity_accounting: bool,
+    /// Configured P prefill permits; also the tightened cap under P KV pressure.
+    pub pd_prefill_permits: usize,
+    /// P KV-usage watermark above which the Program-count cap tightens.
+    pub pd_prefill_kv_high: f64,
+    /// P KV-cache sampling window used for guard freshness.
+    pub pd_prefill_kv_window: Duration,
     /// Metadata source that opts an individual request into Program scheduling.
     pub enable_key: ProgramSchedulingEnableKey,
     /// Preserve Program identity and binding but bypass Router admission.
@@ -70,6 +81,12 @@ pub struct ProgramSchedulerConfig {
 impl Default for ProgramSchedulerConfig {
     fn default() -> Self {
         Self {
+            pd_mode: false,
+            pd_explicit_ttl: false,
+            pd_exclusive_capacity_accounting: true,
+            pd_prefill_permits: 1,
+            pd_prefill_kv_high: 0.85,
+            pd_prefill_kv_window: Duration::from_secs(10),
             enable_key: ProgramSchedulingEnableKey::default(),
             binding_only: false,
             global_queue: false,
@@ -91,9 +108,57 @@ impl Default for ProgramSchedulerConfig {
     }
 }
 
+/// Resolve an optional admission bound: zero means "auto".
+///
+/// Two Programs per configured P prefill permit covers the short tool gaps
+/// between turns; the permit count is the configured proxy for the per-target
+/// decode slot count. The clamp keeps pathological configurations bounded.
+pub(crate) fn resolve_auto_limit(configured: usize, prefill_permits: usize) -> usize {
+    if configured > 0 {
+        return configured;
+    }
+    (2 * prefill_permits.max(1)).clamp(4, 64)
+}
+
 impl From<&crate::config::types::ProgramSchedulingConfig> for ProgramSchedulerConfig {
     fn from(config: &crate::config::types::ProgramSchedulingConfig) -> Self {
+        Self::from_program_config(config, false)
+    }
+}
+
+impl ProgramSchedulerConfig {
+    /// Build the scheduler config for one routing mode. PD mode comes from the
+    /// active `--vllm-pd-disaggregation` route, not from a second config flag.
+    pub fn from_program_config(
+        config: &crate::config::types::ProgramSchedulingConfig,
+        pd_mode: bool,
+    ) -> Self {
+        // Auto sizing is a PD-mode concept. A regular-mode config that omitted
+        // the fields deserializes the zero defaults; keep the historical
+        // 64-Program cap and 1-request overload gate for those deployments.
+        let permits = config.pd.max_prefill_requests_per_target;
+        let max_active_programs_per_target = if config.max_active_programs_per_target > 0 {
+            config.max_active_programs_per_target
+        } else if pd_mode {
+            resolve_auto_limit(0, permits)
+        } else {
+            64
+        };
+        let admission_waiting_request_threshold = if config.admission_waiting_request_threshold > 0
+        {
+            config.admission_waiting_request_threshold
+        } else if pd_mode {
+            resolve_auto_limit(0, permits)
+        } else {
+            1
+        };
         Self {
+            pd_mode,
+            pd_explicit_ttl: config.pd.explicit_ttl,
+            pd_exclusive_capacity_accounting: config.pd.exclusive_capacity_accounting,
+            pd_prefill_permits: config.pd.max_prefill_requests_per_target.max(1),
+            pd_prefill_kv_high: config.pd.prefill_kv_high_watermark,
+            pd_prefill_kv_window: Duration::from_secs_f64(config.pd.prefill_kv_window_seconds),
             enable_key: config.enable_key,
             binding_only: config.binding_only,
             global_queue: config.global_queue,
@@ -101,9 +166,9 @@ impl From<&crate::config::types::ProgramSchedulingConfig> for ProgramSchedulerCo
             cross_rank_headroom_ratio: config.cross_rank_headroom_ratio,
             binding_strategy: config.binding_strategy,
             hash_virtual_nodes: config.hash_virtual_nodes,
-            max_active_programs_per_target: config.max_active_programs_per_target,
+            max_active_programs_per_target,
             metrics_interval: Duration::from_secs_f64(config.metrics_interval_seconds),
-            admission_waiting_request_threshold: config.admission_waiting_request_threshold,
+            admission_waiting_request_threshold,
             queue_timeout: Duration::from_secs_f64(config.queue_timeout_seconds),
             force_resume_timeout: Duration::from_secs_f64(config.force_resume_timeout_seconds),
             paused_retention_ttl: Duration::from_secs_f64(config.paused_retention_ttl_seconds),
@@ -155,6 +220,14 @@ impl ProgramPauseReason {
     }
 }
 
+#[derive(Debug, Clone)]
+struct ActiveRequestReservation {
+    context_tokens: usize,
+    output_tokens: Option<usize>,
+    generated_tokens: usize,
+    progress_observed: bool,
+}
+
 /// Scheduling facts associated with one exact live Program generation.
 #[derive(Debug, Clone)]
 pub(crate) struct ProgramDecisionState {
@@ -176,9 +249,7 @@ pub(crate) struct ProgramDecisionState {
     pub(crate) estimated_context_tokens: usize,
     pub(crate) output_token_reservation: Option<usize>,
     pub(crate) output_token_reservation_source: Option<OutputReservationSource>,
-    pub(crate) current_request_id: Option<u64>,
-    pub(crate) current_request_generated_tokens: usize,
-    pub(crate) output_progress_observed: bool,
+    active_request_reservations: HashMap<u64, ActiveRequestReservation>,
     pub(crate) context_shrink_observations: u8,
     pub(crate) completed_requests: usize,
     pub(crate) segment_served_rounds: usize,
@@ -208,7 +279,7 @@ pub(crate) struct ProgramDecisionState {
     pub(crate) pause_when_idle: bool,
     pub(crate) terminate_when_idle: bool,
     pub(crate) pending_return_prediction: Option<PendingReturnPrediction>,
-    pub(crate) pending_output_prediction: Option<PendingOutputPrediction>,
+    pub(crate) latest_output_prediction: Option<PendingOutputPrediction>,
     pub(crate) last_return_actual_seconds: Option<f64>,
     pub(crate) last_output_actual_tokens: Option<usize>,
 }
@@ -240,9 +311,7 @@ impl ProgramDecisionState {
             estimated_context_tokens,
             output_token_reservation: None,
             output_token_reservation_source: None,
-            current_request_id: None,
-            current_request_generated_tokens: 0,
-            output_progress_observed: false,
+            active_request_reservations: HashMap::new(),
             context_shrink_observations: 0,
             completed_requests: 0,
             segment_served_rounds: 0,
@@ -272,13 +341,18 @@ impl ProgramDecisionState {
             pause_when_idle: false,
             terminate_when_idle: false,
             pending_return_prediction: None,
-            pending_output_prediction: None,
+            latest_output_prediction: None,
             last_return_actual_seconds: None,
             last_output_actual_tokens: None,
         }
     }
 
     pub(crate) fn private_tokens(&self, decode_buffer_tokens: usize) -> f64 {
+        if let Some(tokens) =
+            self.active_request_tokens(decode_buffer_tokens, OutputReservationAdmissionMode::Hard)
+        {
+            return tokens;
+        }
         self.private_tokens_with_output(decode_buffer_tokens, None)
     }
 
@@ -287,23 +361,80 @@ impl ProgramDecisionState {
         decode_buffer_tokens: usize,
         admission_mode: OutputReservationAdmissionMode,
     ) -> f64 {
+        if let Some(tokens) = self.active_request_tokens(decode_buffer_tokens, admission_mode) {
+            return tokens;
+        }
         match admission_mode {
             OutputReservationAdmissionMode::Hard => self.private_tokens(decode_buffer_tokens),
-            OutputReservationAdmissionMode::ContinuousGrowth => self
-                .private_context_tokens()
-                .saturating_add(decode_buffer_tokens.max(self.current_request_generated_tokens))
-                as f64,
+            OutputReservationAdmissionMode::ContinuousGrowth => {
+                self.private_context_tokens()
+                    .saturating_add(decode_buffer_tokens) as f64
+            }
         }
     }
 
-    pub(crate) fn predicted_growth_reserve(
+    pub(crate) fn accounted_private_tokens_with_request(
+        &self,
+        context_tokens: usize,
+        output_tokens: Option<usize>,
+        decode_buffer_tokens: usize,
+        admission_mode: OutputReservationAdmissionMode,
+    ) -> f64 {
+        let context_total = self
+            .active_request_reservations
+            .values()
+            .map(|request| request.context_tokens)
+            .sum::<usize>()
+            .saturating_add(context_tokens)
+            .saturating_sub(self.shared_prefix_tokens);
+        let active_output = self
+            .active_request_reservations
+            .values()
+            .map(|request| match admission_mode {
+                OutputReservationAdmissionMode::Hard => {
+                    request.output_tokens.unwrap_or(decode_buffer_tokens)
+                }
+                OutputReservationAdmissionMode::ContinuousGrowth => {
+                    decode_buffer_tokens.max(request.generated_tokens)
+                }
+            })
+            .sum::<usize>();
+        let request_output = match admission_mode {
+            OutputReservationAdmissionMode::Hard => output_tokens.unwrap_or(decode_buffer_tokens),
+            OutputReservationAdmissionMode::ContinuousGrowth => decode_buffer_tokens,
+        };
+        context_total
+            .saturating_add(active_output)
+            .saturating_add(request_output) as f64
+    }
+
+    fn active_request_tokens(
         &self,
         decode_buffer_tokens: usize,
         admission_mode: OutputReservationAdmissionMode,
     ) -> Option<f64> {
-        (admission_mode == OutputReservationAdmissionMode::ContinuousGrowth)
-            .then_some(self.output_token_reservation)?
-            .map(|tokens| tokens.saturating_sub(decode_buffer_tokens) as f64)
+        if self.active_request_reservations.is_empty() {
+            return None;
+        }
+        let context_tokens = self
+            .active_request_reservations
+            .values()
+            .map(|request| request.context_tokens)
+            .sum::<usize>()
+            .saturating_sub(self.shared_prefix_tokens);
+        let output_tokens = self
+            .active_request_reservations
+            .values()
+            .map(|request| match admission_mode {
+                OutputReservationAdmissionMode::Hard => {
+                    request.output_tokens.unwrap_or(decode_buffer_tokens)
+                }
+                OutputReservationAdmissionMode::ContinuousGrowth => {
+                    decode_buffer_tokens.max(request.generated_tokens)
+                }
+            })
+            .sum::<usize>();
+        Some(context_tokens.saturating_add(output_tokens) as f64)
     }
 
     pub(crate) fn private_context_tokens(&self) -> usize {
@@ -312,37 +443,65 @@ impl ProgramDecisionState {
     }
 
     pub(crate) fn effective_output_reservation(&self, decode_buffer_tokens: usize) -> usize {
+        if !self.active_request_reservations.is_empty() {
+            return self
+                .active_request_reservations
+                .values()
+                .map(|request| request.output_tokens.unwrap_or(decode_buffer_tokens))
+                .sum();
+        }
         self.output_token_reservation
             .unwrap_or(decode_buffer_tokens)
     }
 
-    pub(crate) fn begin_request_progress(&mut self, request_id: u64) {
-        self.current_request_id = Some(request_id);
-        self.current_request_generated_tokens = 0;
-        self.output_progress_observed = false;
+    pub(crate) fn begin_request_progress(
+        &mut self,
+        attempt_id: u64,
+        context_tokens: usize,
+        output_tokens: Option<usize>,
+    ) {
+        self.active_request_reservations.insert(
+            attempt_id,
+            ActiveRequestReservation {
+                context_tokens,
+                output_tokens,
+                generated_tokens: 0,
+                progress_observed: false,
+            },
+        );
     }
 
     pub(crate) fn observe_generation_progress(
         &mut self,
-        request_id: u64,
+        attempt_id: u64,
         generated_tokens: usize,
     ) -> bool {
-        if self.current_request_id != Some(request_id)
-            || generated_tokens <= self.current_request_generated_tokens
-        {
+        let Some(request) = self.active_request_reservations.get_mut(&attempt_id) else {
+            return false;
+        };
+        if generated_tokens <= request.generated_tokens {
             return false;
         }
-        self.current_request_generated_tokens = generated_tokens;
-        self.output_progress_observed = true;
+        request.generated_tokens = generated_tokens;
+        request.progress_observed = true;
         true
     }
 
-    pub(crate) fn finish_request_progress(&mut self, request_id: u64) {
-        if self.current_request_id == Some(request_id) {
-            self.current_request_id = None;
-            self.current_request_generated_tokens = 0;
-            self.output_progress_observed = false;
-        }
+    pub(crate) fn finish_request_progress(&mut self, attempt_id: u64) {
+        self.active_request_reservations.remove(&attempt_id);
+    }
+
+    pub(crate) fn current_request_generated_tokens(&self) -> usize {
+        self.active_request_reservations
+            .values()
+            .map(|request| request.generated_tokens)
+            .sum()
+    }
+
+    pub(crate) fn output_progress_observed(&self) -> bool {
+        self.active_request_reservations
+            .values()
+            .any(|request| request.progress_observed)
     }
 
     pub(crate) fn remaining_predicted_output_tokens(
@@ -350,17 +509,30 @@ impl ProgramDecisionState {
         decode_buffer_tokens: usize,
         backend_usage_includes_generated: bool,
     ) -> Option<usize> {
-        if !self.output_progress_observed {
+        if self.active_request_reservations.is_empty()
+            || self
+                .active_request_reservations
+                .values()
+                .any(|request| !request.progress_observed || request.output_tokens.is_none())
+        {
             return None;
         }
-        let reservation = self.output_token_reservation?;
-        let accounted_generated = if backend_usage_includes_generated {
-            self.current_request_generated_tokens
-        } else {
-            self.current_request_generated_tokens
-                .max(decode_buffer_tokens)
-        };
-        Some(reservation.saturating_sub(accounted_generated))
+        Some(
+            self.active_request_reservations
+                .values()
+                .map(|request| {
+                    let accounted_generated = if backend_usage_includes_generated {
+                        request.generated_tokens
+                    } else {
+                        request.generated_tokens.max(decode_buffer_tokens)
+                    };
+                    request
+                        .output_tokens
+                        .unwrap_or_default()
+                        .saturating_sub(accounted_generated)
+                })
+                .sum(),
+        )
     }
 
     pub(crate) fn private_tokens_with_output(
@@ -368,11 +540,30 @@ impl ProgramDecisionState {
         decode_buffer_tokens: usize,
         expected_output_tokens: Option<usize>,
     ) -> f64 {
-        self.private_context_tokens().saturating_add(
-            expected_output_tokens
-                .or(self.output_token_reservation)
-                .unwrap_or(decode_buffer_tokens),
-        ) as f64
+        self.private_tokens_from_context(
+            self.estimated_context_tokens,
+            decode_buffer_tokens,
+            expected_output_tokens,
+        )
+    }
+
+    /// Private KV footprint for an explicit request-scoped context estimate.
+    ///
+    /// Admission of a queued turn must charge that turn's own prompt, not the
+    /// largest prompt of any later turn already retained behind it.
+    pub(crate) fn private_tokens_from_context(
+        &self,
+        context_tokens: usize,
+        decode_buffer_tokens: usize,
+        expected_output_tokens: Option<usize>,
+    ) -> f64 {
+        context_tokens
+            .saturating_sub(self.shared_prefix_tokens)
+            .saturating_add(
+                expected_output_tokens
+                    .or(self.output_token_reservation)
+                    .unwrap_or(decode_buffer_tokens),
+            ) as f64
     }
 
     pub(crate) fn observe_completed_context(&mut self, observed_context_tokens: usize) {
@@ -442,6 +633,25 @@ pub(crate) struct ProgramSchedulerState {
     pub(crate) prediction_profiles: PredictionProfileStore,
     pub(crate) next_prediction_snapshot_at: Instant,
     pub(crate) lineage: ProgramLineage,
+    /// Most recent P-side KV-cache pressure sample.
+    pub(crate) prefill_pressure: Option<PrefillPressure>,
+    /// Per-P-target metrics samples, keyed by base URL.
+    pub(crate) prefill_targets: HashMap<String, PrefillTargetObservation>,
+}
+
+/// P KV-cache usage as seen from the prefill engines.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PrefillPressure {
+    pub(crate) kv_usage: f64,
+    pub(crate) observed_at: Instant,
+}
+
+/// One prefill target's metrics sample, used by the warm-read pressure gates.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PrefillTargetObservation {
+    pub(crate) kv_usage: Option<f64>,
+    pub(crate) running_requests: Option<usize>,
+    pub(crate) observed_at: Instant,
 }
 
 impl ProgramSchedulerState {
@@ -473,11 +683,13 @@ impl ProgramSchedulerState {
             next_prediction_snapshot_at: Instant::now()
                 + Duration::from_secs_f64(config.prediction_profile.snapshot_interval_seconds),
             lineage: ProgramLineage::default(),
+            prefill_pressure: None,
+            prefill_targets: HashMap::new(),
         }
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
     use crate::program_scheduling::{DecodeThroughputModel, PrefillCostModel};
@@ -494,6 +706,33 @@ mod tests {
         assert_eq!(config.progress_ttl.max_segment_rounds, 14);
         assert_eq!(config.progress_ttl.prefill, PrefillCostModel::default());
         assert_eq!(config.progress_ttl.decode, DecodeThroughputModel::default());
+    }
+
+    #[test]
+    fn auto_admission_limits_follow_the_prefill_permits() {
+        assert_eq!(resolve_auto_limit(0, 4), 8);
+        assert_eq!(resolve_auto_limit(0, 1), 4);
+        assert_eq!(resolve_auto_limit(0, 64), 64);
+        assert_eq!(resolve_auto_limit(3, 4), 3);
+        assert_eq!(resolve_auto_limit(96, 4), 96);
+
+        let parsed: crate::config::types::ProgramSchedulingConfig =
+            serde_json::from_str(r#"{"pd":{"max_prefill_requests_per_target":4}}"#).unwrap();
+        let runtime = ProgramSchedulerConfig::from_program_config(&parsed, true);
+        assert_eq!(runtime.max_active_programs_per_target, 8);
+        assert_eq!(runtime.admission_waiting_request_threshold, 8);
+        assert!(runtime.pd_exclusive_capacity_accounting);
+        assert_eq!(runtime.pd_prefill_permits, 4);
+        assert_eq!(runtime.pd_prefill_kv_high, 0.85);
+
+        // Regular deployments deserialize the zero defaults but must keep the
+        // historical admission pool and overload gate.
+        let regular: crate::config::types::ProgramSchedulingConfig =
+            serde_json::from_str("{}").unwrap();
+        let runtime = ProgramSchedulerConfig::from(&regular);
+        assert!(!runtime.pd_mode);
+        assert_eq!(runtime.max_active_programs_per_target, 64);
+        assert_eq!(runtime.admission_waiting_request_threshold, 1);
     }
 
     #[test]
