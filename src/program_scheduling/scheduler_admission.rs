@@ -235,6 +235,9 @@ impl ProgramScheduler {
                 self.config.progress_ttl.decode_buffer_tokens,
                 reservation_factor,
             );
+            debug_assert!(state
+                .runtime
+                .set_request_output_reservation(&handle, output_reservation));
             self.ensure_decision_state_with_reservation(
                 &mut state,
                 &identity,
@@ -459,6 +462,7 @@ impl ProgramScheduler {
                 return None;
             }
         }
+        let output_reservation = self.front_output_reservation(&state, handle.program());
         let dispatch = state.runtime.admit_front(handle, target, Instant::now())?;
         // Promote the admitted turn's context estimate: the front request is
         // now the Program's active turn, and later admission must account for
@@ -468,6 +472,8 @@ impl ProgramScheduler {
                 decision.estimated_context_tokens = dispatch.estimated_context_tokens();
                 decision.context_shrink_observations = 0;
             }
+            decision.output_token_reservation = output_reservation.tokens;
+            decision.output_token_reservation_source = output_reservation.source;
             decision.begin_request_progress(dispatch.request_id());
         }
         RouterMetrics::record_agent_aware_queue_wait(
@@ -517,15 +523,13 @@ impl ProgramScheduler {
                 .as_ref()
                 .is_some_and(|view| view.in_flight_requests == 0)
         {
-            let next_output = state
-                .runtime
-                .front_request_hints(handle.program())
-                .and_then(|hints| hints.expected_output_tokens);
+            let next_output = self.front_output_reservation(&state, handle.program());
             // The next retained turn may have a larger prompt. Charge it
             // before the next claim_dispatch capacity check.
             let next_context = state.runtime.front_request_context(handle.program());
             if let Some(decision) = state.decisions.get_mut(handle.program()) {
-                decision.output_token_reservation = next_output;
+                decision.output_token_reservation = next_output.tokens;
+                decision.output_token_reservation_source = next_output.source;
                 if let Some(context_tokens) = next_context {
                     if context_tokens != decision.estimated_context_tokens {
                         decision.estimated_context_tokens = context_tokens;
@@ -534,10 +538,14 @@ impl ProgramScheduler {
                 }
             }
         }
-        let after_tokens = state
-            .decisions
-            .get(handle.program())
-            .map(|decision| decision.private_tokens(self.config.progress_ttl.decode_buffer_tokens));
+        let after_tokens = state.decisions.get(handle.program()).map(|decision| {
+            decision.accounted_private_tokens(
+                self.config.progress_ttl.decode_buffer_tokens,
+                self.config
+                    .prediction_profile
+                    .output_reservation_admission_mode,
+            )
+        });
         if let (Some(before), Some(after), Some(tokens), Some(next_tokens), Some(target_id)) = (
             before,
             after,
@@ -733,8 +741,8 @@ impl ProgramScheduler {
             return Ordering::Equal;
         }
         match (
-            state.decisions[left].output_token_reservation,
-            state.decisions[right].output_token_reservation,
+            self.front_output_reservation(state, left).tokens,
+            self.front_output_reservation(state, right).tokens,
         ) {
             (Some(left), Some(right)) => left.cmp(&right),
             _ => Ordering::Equal,
@@ -769,6 +777,44 @@ impl ProgramScheduler {
             .queued_at
             .cmp(&state.decisions[right].queued_at)
             .then_with(|| left.program_id().cmp(right.program_id()))
+    }
+
+    pub(crate) fn front_output_reservation(
+        &self,
+        state: &ProgramSchedulerState,
+        program: &ProgramRef,
+    ) -> output_length::OutputReservation {
+        if let Some(reservation) = state.runtime.front_request_output_reservation(program) {
+            return reservation;
+        }
+        if state
+            .runtime
+            .view(program)
+            .is_none_or(|runtime| runtime.waiting_requests == 0)
+        {
+            return output_length::OutputReservation::default();
+        }
+        if let Some(tokens) = state
+            .runtime
+            .front_request_hints(program)
+            .and_then(|hints| hints.expected_output_tokens)
+        {
+            return output_length::OutputReservation {
+                tokens: Some(tokens),
+                source: Some(output_length::OutputReservationSource::Explicit),
+            };
+        }
+        if let Some(decision) = state.decisions.get(program) {
+            if decision.output_token_reservation.is_some()
+                || decision.output_token_reservation_source.is_some()
+            {
+                return output_length::OutputReservation {
+                    tokens: decision.output_token_reservation,
+                    source: decision.output_token_reservation_source,
+                };
+            }
+        }
+        output_length::OutputReservation::default()
     }
 
     pub(crate) fn rank_admission_plan(
@@ -820,10 +866,7 @@ impl ProgramScheduler {
             .collect::<Vec<_>>();
         let used_tokens = self.target_usage(state, target_id, now);
         let active_count = active.len();
-        let expected_output_tokens = state
-            .runtime
-            .front_request_hints(program)
-            .and_then(|hints| hints.expected_output_tokens);
+        let output_reservation = self.front_output_reservation(state, program);
         // Charge the front turn's own prompt. A later retained turn with a
         // larger prompt must not inflate the front turn's capacity check.
         let context_tokens = state
@@ -839,7 +882,7 @@ impl ProgramScheduler {
             OutputReservationAdmissionMode::Hard => decision.private_tokens_from_context(
                 context_tokens,
                 decode_buffer_tokens,
-                expected_output_tokens,
+                output_reservation.tokens,
             ),
             OutputReservationAdmissionMode::ContinuousGrowth => decision
                 .private_tokens_from_context(
@@ -868,12 +911,18 @@ impl ProgramScheduler {
         };
         let low = capacity_tokens as f64 * self.config.progress_ttl.low_watermark_ratio;
         let immediate_fits = used_tokens + required_tokens <= low;
-        let candidate_growth_reserve = decision.predicted_growth_reserve(
-            self.config.progress_ttl.decode_buffer_tokens,
-            self.config
-                .prediction_profile
-                .output_reservation_admission_mode,
-        );
+        let candidate_growth_reserve = if self
+            .config
+            .prediction_profile
+            .output_reservation_admission_mode
+            == OutputReservationAdmissionMode::ContinuousGrowth
+        {
+            output_reservation
+                .tokens
+                .map(|tokens| tokens.saturating_sub(decode_buffer_tokens) as f64)
+        } else {
+            None
+        };
         let factors = state.rank_factors.get(target_id);
         let backend_usage_includes_generated =
             self.observed_target_usage(state, target_id, now).is_some();
@@ -991,17 +1040,14 @@ impl ProgramScheduler {
             .decisions
             .get(program)
             .and_then(|decision| decision.last_target.clone());
-        let current_tokens = state
-            .decisions
-            .get(program)
-            .map(|decision| {
-                decision.accounted_private_tokens(
-                    self.config.progress_ttl.decode_buffer_tokens,
-                    self.config
-                        .prediction_profile
-                        .output_reservation_admission_mode,
-                )
-            });
+        let current_tokens = state.decisions.get(program).map(|decision| {
+            decision.accounted_private_tokens(
+                self.config.progress_ttl.decode_buffer_tokens,
+                self.config
+                    .prediction_profile
+                    .output_reservation_admission_mode,
+            )
+        });
         let Some(current_tokens) = current_tokens else {
             return false;
         };
@@ -1953,6 +1999,13 @@ mod tests {
         let identity = identity_with_expected_output("program", 600);
         let mut state = scheduler.state.lock();
         let handle = state.runtime.retain_request(&identity, 100, None, now);
+        assert!(state.runtime.set_request_output_reservation(
+            &handle,
+            output_length::OutputReservation {
+                tokens: Some(350),
+                source: Some(output_length::OutputReservationSource::Explicit),
+            },
+        ));
         scheduler.ensure_decision_state_with_reservation(
             &mut state,
             &identity,

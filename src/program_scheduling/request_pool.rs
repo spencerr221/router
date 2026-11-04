@@ -3,6 +3,7 @@
 //! RequestPool owns request blocking data only. It does not select targets,
 //! estimate capacity, run retries, or decide Program state transitions.
 
+use super::output_length::OutputReservation;
 use super::{ProgramRef, ProgramRequestHints};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -37,6 +38,7 @@ pub(crate) struct PendingProgramRequest {
     pub(crate) estimated_context_tokens: usize,
     pub(crate) routing_text: Option<String>,
     pub(crate) hints: ProgramRequestHints,
+    output_reservation: Option<OutputReservation>,
     notifier: Arc<Notify>,
 }
 
@@ -70,6 +72,7 @@ impl RequestPool {
                 estimated_context_tokens,
                 routing_text: routing_text.map(str::to_string),
                 hints,
+                output_reservation: None,
                 notifier: Arc::clone(&notifier),
             });
         self.retained_request_count = self.retained_request_count.saturating_add(1);
@@ -164,6 +167,34 @@ impl RequestPool {
             .and_then(VecDeque::front)
             .map(|request| request.estimated_context_tokens)
     }
+
+    /// Store the resolved output reservation on its exact retained request.
+    pub(crate) fn set_output_reservation(
+        &mut self,
+        handle: &ProgramRequestHandle,
+        reservation: OutputReservation,
+    ) -> bool {
+        let Some(request) = self.requests.get_mut(handle.program()).and_then(|queue| {
+            queue
+                .iter_mut()
+                .find(|request| request.id == handle.request_id)
+        }) else {
+            return false;
+        };
+        request.output_reservation = Some(reservation);
+        true
+    }
+
+    /// Resolved output reservation for the Program's front retained request.
+    pub(crate) fn front_output_reservation(
+        &self,
+        program: &ProgramRef,
+    ) -> Option<OutputReservation> {
+        self.requests
+            .get(program)
+            .and_then(VecDeque::front)
+            .and_then(|request| request.output_reservation)
+    }
 }
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
@@ -245,6 +276,39 @@ mod tests {
             pool.front(&new_front).unwrap().estimated_context_tokens,
             120
         );
+    }
+
+    #[test]
+    fn output_reservations_follow_exact_fifo_requests() {
+        let mut pool = RequestPool::default();
+        let program = program(1);
+        let first = pool.retain(
+            program.clone(),
+            Instant::now(),
+            100,
+            None,
+            ProgramRequestHints::default(),
+        );
+        let second = pool.retain(
+            program.clone(),
+            Instant::now(),
+            100,
+            None,
+            ProgramRequestHints::default(),
+        );
+        let short = OutputReservation {
+            tokens: Some(128),
+            source: None,
+        };
+        let long = OutputReservation {
+            tokens: Some(2_048),
+            source: None,
+        };
+        assert!(pool.set_output_reservation(&first, short));
+        assert!(pool.set_output_reservation(&second, long));
+        assert_eq!(pool.front_output_reservation(&program), Some(short));
+        pool.take_front(&first).unwrap();
+        assert_eq!(pool.front_output_reservation(&program), Some(long));
     }
 
     #[tokio::test]

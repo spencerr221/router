@@ -3,6 +3,7 @@
 //! ProgramRuntime mutates lifecycle facts but makes no scheduling decisions.
 //! A policy decides when to call admit, resume, pause, or release.
 
+use super::output_length::OutputReservation;
 use super::request_pool::RequestPool;
 use super::{
     ProgramDispatch, ProgramIdentity, ProgramRef, ProgramRequestHandle, ProgramRequestHints,
@@ -152,6 +153,7 @@ impl ProgramRuntime {
         let mut replacement = ProgramDispatch::new(
             self.next_attempt_id,
             old.program().clone(),
+            old.request_id(),
             old.target_id.clone(),
             old.placement_epoch(),
             old.request_arrived_at(),
@@ -377,6 +379,24 @@ impl ProgramRuntime {
     /// Prompt estimate belonging to the Program's front retained turn.
     pub(crate) fn front_request_context(&self, program_ref: &ProgramRef) -> Option<usize> {
         self.request_pool.front_context_tokens(program_ref)
+    }
+
+    /// Attach a resolved output reservation to one exact retained request.
+    pub(crate) fn set_request_output_reservation(
+        &mut self,
+        handle: &ProgramRequestHandle,
+        reservation: OutputReservation,
+    ) -> bool {
+        self.request_pool
+            .set_output_reservation(handle, reservation)
+    }
+
+    /// Resolved output reservation belonging to the front retained request.
+    pub(crate) fn front_request_output_reservation(
+        &self,
+        program_ref: &ProgramRef,
+    ) -> Option<OutputReservation> {
+        self.request_pool.front_output_reservation(program_ref)
     }
 
     /// Immutable lifecycle view used by scheduling decisions under one lock.

@@ -3,7 +3,6 @@
 //! Completion is the only path that records request-derived rolling factors.
 //! Periodic ticks evaluate existing deadlines and never create request facts.
 
-use super::output_length::OutputReservationSource;
 use super::return_time;
 use super::scheduler::ProgramScheduler;
 use super::scheduler_state::{ProgramPauseReason, ProgramSchedulerState};
@@ -193,10 +192,7 @@ impl ProgramScheduler {
             return;
         }
         let runtime_after = state.runtime.view(dispatch.program());
-        let next_output_reservation = state
-            .runtime
-            .front_request_hints(dispatch.program())
-            .and_then(|h| h.expected_output_tokens);
+        let next_output_reservation = self.front_output_reservation(&state, dispatch.program());
 
         // A retained successor continues the same reasoning placement. Match
         // the historical Router behavior by cancelling a deferred capacity
@@ -408,12 +404,15 @@ impl ProgramScheduler {
             }
             decision.finish_request_progress(dispatch.request_id());
             decision.output_token_reservation = if self.config.pd_mode {
-                next_output_reservation
+                next_output_reservation.tokens
             } else {
                 None
             };
-            decision.output_token_reservation_source =
-                next_output_reservation.map(|_| OutputReservationSource::Explicit);
+            decision.output_token_reservation_source = if self.config.pd_mode {
+                next_output_reservation.source
+            } else {
+                None
+            };
         }
         // The retained successor is now the front turn. In PD mode its
         // request-scoped context may be smaller than the completed turn's;

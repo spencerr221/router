@@ -20,7 +20,7 @@ impl OutputReservationSource {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct OutputReservation {
     pub tokens: Option<usize>,
     pub source: Option<OutputReservationSource>,
