@@ -270,7 +270,12 @@ impl ProgramScheduler {
             return false;
         };
         let waiter_required = state.decisions.get(&waiter).map_or(0.0, |decision| {
-            decision.private_tokens(self.config.progress_ttl.decode_buffer_tokens)
+            decision.accounted_private_tokens(
+                self.config.progress_ttl.decode_buffer_tokens,
+                self.config
+                    .prediction_profile
+                    .output_reservation_admission_mode,
+            )
         });
         let future_relief = state
             .runtime
@@ -286,7 +291,14 @@ impl ProgramScheduler {
                     .get(runtime.reference)
                     .filter(|decision| decision.pause_when_idle)
             })
-            .map(|decision| decision.private_tokens(self.config.progress_ttl.decode_buffer_tokens))
+            .map(|decision| {
+                decision.accounted_private_tokens(
+                    self.config.progress_ttl.decode_buffer_tokens,
+                    self.config
+                        .prediction_profile
+                        .output_reservation_admission_mode,
+                )
+            })
             .sum::<f64>();
         waiter_required > future_relief
             && self.pause_idle(state, program, ProgramPauseReason::MaxSegmentYield, now)

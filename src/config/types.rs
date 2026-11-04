@@ -137,9 +137,23 @@ pub enum PredictionMode {
     /// Collect and evaluate predictions without changing scheduling decisions.
     #[default]
     Shadow,
+    /// Use mature output-length predictions for request capacity reservation.
+    Active,
 }
 
-/// Shared configuration for workflow-profile shadow predictors.
+/// How active output-length reservations participate in capacity admission.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OutputReservationAdmissionMode {
+    /// Treat the full output reservation as immediately required capacity.
+    #[default]
+    Hard,
+    /// Keep only the decode buffer hard and add predicted growth to the
+    /// bypassable continuous-growth reserve.
+    ContinuousGrowth,
+}
+
+/// Shared configuration for workflow-profile predictors.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PredictionProfileConfig {
     #[serde(default)]
@@ -168,6 +182,14 @@ pub struct PredictionProfileConfig {
     pub output_length_bucket_bounds_tokens: Vec<usize>,
     #[serde(default = "default_output_length_quantile")]
     pub output_length_quantile: f64,
+    /// Fraction of the predicted output above `decode_buffer_tokens` reserved
+    /// for admission. The decode buffer remains the minimum reservation.
+    #[serde(default = "default_output_reservation_factor")]
+    pub output_reservation_factor: f64,
+    /// Place predicted output either in hard required capacity or in the
+    /// continuous-growth reserve evaluated by batch-gain admission.
+    #[serde(default)]
+    pub output_reservation_admission_mode: OutputReservationAdmissionMode,
     #[serde(default = "default_output_length_min_support")]
     pub output_length_min_support: usize,
     #[serde(default = "default_output_length_tail_samples")]
@@ -193,6 +215,8 @@ impl Default for PredictionProfileConfig {
             step_bucket_size: default_prediction_step_bucket_size(),
             output_length_bucket_bounds_tokens: default_output_length_bucket_bounds_tokens(),
             output_length_quantile: default_output_length_quantile(),
+            output_reservation_factor: default_output_reservation_factor(),
+            output_reservation_admission_mode: OutputReservationAdmissionMode::default(),
             output_length_min_support: default_output_length_min_support(),
             output_length_tail_samples: default_output_length_tail_samples(),
             stability_window_size: default_prediction_stability_window_size(),
@@ -427,7 +451,16 @@ pub struct ProgramSchedulingConfig {
     pub stats_window_size: usize,
     #[serde(default = "default_program_enable_batch_gain_admission")]
     pub enable_batch_gain_admission: bool,
-    /// Offline-seeded, online-updated workflow prediction in off/shadow mode.
+    /// Replace historical active growth with observed remaining predicted output.
+    #[serde(default)]
+    pub prediction_remaining_output_reservation: bool,
+    /// Let trustworthy predictions reduce, but never increase, historical growth reserve.
+    #[serde(default)]
+    pub prediction_one_sided_growth_reservation: bool,
+    /// Prefer shorter predicted outputs within the same local fairness tier.
+    #[serde(default)]
+    pub prediction_shortest_output_first: bool,
+    /// Offline-seeded, online-updated workflow prediction.
     #[serde(default)]
     pub prediction_profile: PredictionProfileConfig,
     /// Offline-calibrated cold-prefill cost and mixed-batch decode impact.
@@ -548,6 +581,9 @@ impl Default for ProgramSchedulingConfig {
             max_segment_rounds: default_program_max_segment_rounds(),
             stats_window_size: default_program_stats_window_size(),
             enable_batch_gain_admission: default_program_enable_batch_gain_admission(),
+            prediction_remaining_output_reservation: false,
+            prediction_one_sided_growth_reservation: false,
+            prediction_shortest_output_first: false,
             prediction_profile: PredictionProfileConfig::default(),
             prefill_cost_model: PrefillCostModel::default(),
             decode_throughput_model: DecodeThroughputModel::default(),
@@ -610,6 +646,12 @@ struct ProgramSchedulingConfigInput {
     stats_window_size: usize,
     #[serde(default = "default_program_enable_batch_gain_admission")]
     enable_batch_gain_admission: bool,
+    #[serde(default)]
+    prediction_remaining_output_reservation: bool,
+    #[serde(default)]
+    prediction_one_sided_growth_reservation: bool,
+    #[serde(default)]
+    prediction_shortest_output_first: bool,
     #[serde(default)]
     prediction_profile: PredictionProfileConfig,
     #[serde(default)]
@@ -722,6 +764,9 @@ impl<'de> Deserialize<'de> for ProgramSchedulingConfig {
             max_segment_rounds: input.max_segment_rounds,
             stats_window_size: input.stats_window_size,
             enable_batch_gain_admission: input.enable_batch_gain_admission,
+            prediction_remaining_output_reservation: input.prediction_remaining_output_reservation,
+            prediction_one_sided_growth_reservation: input.prediction_one_sided_growth_reservation,
+            prediction_shortest_output_first: input.prediction_shortest_output_first,
             prediction_profile: input.prediction_profile,
             prefill_cost_model,
             decode_throughput_model,
@@ -838,6 +883,10 @@ fn default_output_length_bucket_bounds_tokens() -> Vec<usize> {
 
 fn default_output_length_quantile() -> f64 {
     0.95
+}
+
+fn default_output_reservation_factor() -> f64 {
+    1.0
 }
 
 fn default_output_length_min_support() -> usize {
@@ -1591,6 +1640,36 @@ mod tests {
         let serialized = serde_json::to_value(legacy).unwrap();
         assert_eq!(serialized["token_capacity_per_dp_rank"], 456);
         assert!(serialized.get("token_capacity_per_target").is_none());
+    }
+
+    #[test]
+    fn program_scheduling_accepts_active_prediction_mode() {
+        let config: ProgramSchedulingConfig =
+            serde_json::from_str(r#"{"prediction_profile":{"mode":"active"}}"#).unwrap();
+        assert_eq!(config.prediction_profile.mode, PredictionMode::Active);
+        assert_eq!(config.prediction_profile.output_reservation_factor, 1.0);
+
+        let scaled: ProgramSchedulingConfig = serde_json::from_str(
+            r#"{"prediction_profile":{"mode":"active","output_reservation_factor":0.5,"output_reservation_admission_mode":"continuous_growth"}}"#,
+        )
+        .unwrap();
+        assert_eq!(scaled.prediction_profile.output_reservation_factor, 0.5);
+        assert_eq!(
+            scaled.prediction_profile.output_reservation_admission_mode,
+            OutputReservationAdmissionMode::ContinuousGrowth
+        );
+
+        let soft_reserve: ProgramSchedulingConfig = serde_json::from_str(
+            r#"{
+                "prediction_remaining_output_reservation": true,
+                "prediction_one_sided_growth_reservation": true,
+                "prediction_shortest_output_first": true
+            }"#,
+        )
+        .unwrap();
+        assert!(soft_reserve.prediction_remaining_output_reservation);
+        assert!(soft_reserve.prediction_one_sided_growth_reservation);
+        assert!(soft_reserve.prediction_shortest_output_first);
     }
 
     #[test]

@@ -61,6 +61,13 @@ impl ConfigValidator {
                 reason: "reasoning_token_balance requires token_capacity_per_dp_rank".to_string(),
             });
         }
+        if config.prediction_profile.mode == PredictionMode::Active
+            && config.token_capacity_per_dp_rank.is_none()
+        {
+            return Err(ConfigError::ValidationFailed {
+                reason: "active prediction requires token_capacity_per_dp_rank".to_string(),
+            });
+        }
         let positive_finite = [
             ("metrics_interval_seconds", config.metrics_interval_seconds),
             ("queue_timeout_seconds", config.queue_timeout_seconds),
@@ -210,12 +217,13 @@ impl ConfigValidator {
             || prediction.return_time_horizon_seconds <= 0.0
             || !prediction.output_length_quantile.is_finite()
             || !(0.0..1.0).contains(&prediction.output_length_quantile)
+            || !prediction.output_reservation_factor.is_finite()
+            || !(0.0..=1.0).contains(&prediction.output_reservation_factor)
             || !prediction.stability_tolerance.is_finite()
             || prediction.stability_tolerance < 0.0
         {
             return Err(ConfigError::ValidationFailed {
-                reason: "Prediction horizons, quantiles, and stability tolerance are invalid"
-                    .to_string(),
+                reason: "Prediction horizons, quantiles, reservation factors, and stability tolerance are invalid".to_string(),
             });
         }
         if !strictly_increasing_f64(&prediction.return_time_bucket_bounds_seconds)
@@ -713,6 +721,13 @@ impl ConfigValidator {
                         .to_string(),
                 });
             }
+            if pd_mode && program.prediction_profile.mode == PredictionMode::Active {
+                return Err(ConfigError::IncompatibleConfig {
+                    reason:
+                        "active output-length prediction does not support vLLM PD mode; use off or shadow"
+                            .to_string(),
+                });
+            }
             if pd_mode {
                 program
                     .pd
@@ -1121,6 +1136,32 @@ mod tests {
     }
 
     #[test]
+    fn active_prediction_requires_token_capacity() {
+        let mut config = ProgramSchedulingConfig::default();
+        config.prediction_profile.mode = PredictionMode::Active;
+        let error = ConfigValidator::validate_program_scheduling(&config)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("active prediction requires token_capacity_per_dp_rank"));
+
+        config.token_capacity_per_dp_rank = Some(1_000);
+        assert!(ConfigValidator::validate_program_scheduling(&config).is_ok());
+    }
+
+    #[test]
+    fn output_reservation_factor_must_be_between_zero_and_one() {
+        let mut config = ProgramSchedulingConfig::default();
+        config.prediction_profile.output_reservation_factor = -0.01;
+        assert!(ConfigValidator::validate_program_scheduling(&config).is_err());
+
+        config.prediction_profile.output_reservation_factor = 1.01;
+        assert!(ConfigValidator::validate_program_scheduling(&config).is_err());
+
+        config.prediction_profile.output_reservation_factor = 0.5;
+        assert!(ConfigValidator::validate_program_scheduling(&config).is_ok());
+    }
+
+    #[test]
     fn test_validate_regular_mode() {
         let config = RouterConfig::new(
             RoutingMode::Regular {
@@ -1320,6 +1361,29 @@ mod tests {
         );
 
         assert!(ConfigValidator::validate(&config).is_ok());
+    }
+
+    #[test]
+    fn active_output_prediction_rejects_pd_mode() {
+        let mut config = RouterConfig::new(
+            RoutingMode::VllmPrefillDecode {
+                prefill_urls: vec![("http://prefill:8000".to_string(), Some(8081))],
+                decode_urls: vec!["http://decode:8000".to_string()],
+                prefill_policy: None,
+                decode_policy: None,
+                discovery_address: None,
+            },
+            PolicyConfig::Random,
+        );
+        let mut program = ProgramSchedulingConfig {
+            token_capacity_per_dp_rank: Some(1_000),
+            ..Default::default()
+        };
+        program.prediction_profile.mode = PredictionMode::Active;
+        config.program_scheduling = Some(program);
+
+        let error = ConfigValidator::validate(&config).unwrap_err().to_string();
+        assert!(error.contains("active output-length prediction does not support vLLM PD mode"));
     }
 
     #[test]

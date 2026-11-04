@@ -1562,6 +1562,7 @@ mod tests {
         ProgramDispatch::new(
             attempt,
             ProgramRef::new("tenant/model".into(), "task".into(), generation),
+            attempt,
             "d".into(),
             epoch,
             Instant::now(),

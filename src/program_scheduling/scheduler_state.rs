@@ -4,13 +4,14 @@
 //! They are decision facts, not an additional Program lifecycle state machine.
 
 use super::lineage::ProgramLineage;
-use super::output_length::PendingOutputPrediction;
+use super::output_length::{OutputReservationSource, PendingOutputPrediction};
 use super::prediction_profile::PredictionProfileStore;
 use super::return_time::PendingReturnPrediction;
 use super::{
     ProgramBindingStrategy, ProgramBindings, ProgramRef, ProgramRuntime,
     ProgramSchedulingEnableKey, ProgramTarget, ProgressTtlConfig, ProgressTtlFactors,
 };
+use crate::config::types::OutputReservationAdmissionMode;
 use crate::config::types::PredictionProfileConfig;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
@@ -184,6 +185,11 @@ impl ProgramSchedulerConfig {
                 max_segment_rounds: config.max_segment_rounds,
                 stats_window_size: config.stats_window_size,
                 enable_batch_gain_admission: config.enable_batch_gain_admission,
+                prediction_remaining_output_reservation: config
+                    .prediction_remaining_output_reservation,
+                prediction_one_sided_growth_reservation: config
+                    .prediction_one_sided_growth_reservation,
+                prediction_shortest_output_first: config.prediction_shortest_output_first,
                 prefill: config.prefill_cost_model,
                 decode: config.decode_throughput_model,
             },
@@ -214,6 +220,14 @@ impl ProgramPauseReason {
     }
 }
 
+#[derive(Debug, Clone)]
+struct ActiveRequestReservation {
+    context_tokens: usize,
+    output_tokens: Option<usize>,
+    generated_tokens: usize,
+    progress_observed: bool,
+}
+
 /// Scheduling facts associated with one exact live Program generation.
 #[derive(Debug, Clone)]
 pub(crate) struct ProgramDecisionState {
@@ -234,6 +248,8 @@ pub(crate) struct ProgramDecisionState {
     pub(crate) last_target: Option<String>,
     pub(crate) estimated_context_tokens: usize,
     pub(crate) output_token_reservation: Option<usize>,
+    pub(crate) output_token_reservation_source: Option<OutputReservationSource>,
+    active_request_reservations: HashMap<u64, ActiveRequestReservation>,
     pub(crate) context_shrink_observations: u8,
     pub(crate) completed_requests: usize,
     pub(crate) segment_served_rounds: usize,
@@ -294,6 +310,8 @@ impl ProgramDecisionState {
             home_target,
             estimated_context_tokens,
             output_token_reservation: None,
+            output_token_reservation_source: None,
+            active_request_reservations: HashMap::new(),
             context_shrink_observations: 0,
             completed_requests: 0,
             segment_served_rounds: 0,
@@ -330,7 +348,191 @@ impl ProgramDecisionState {
     }
 
     pub(crate) fn private_tokens(&self, decode_buffer_tokens: usize) -> f64 {
+        if let Some(tokens) =
+            self.active_request_tokens(decode_buffer_tokens, OutputReservationAdmissionMode::Hard)
+        {
+            return tokens;
+        }
         self.private_tokens_with_output(decode_buffer_tokens, None)
+    }
+
+    pub(crate) fn accounted_private_tokens(
+        &self,
+        decode_buffer_tokens: usize,
+        admission_mode: OutputReservationAdmissionMode,
+    ) -> f64 {
+        if let Some(tokens) = self.active_request_tokens(decode_buffer_tokens, admission_mode) {
+            return tokens;
+        }
+        match admission_mode {
+            OutputReservationAdmissionMode::Hard => self.private_tokens(decode_buffer_tokens),
+            OutputReservationAdmissionMode::ContinuousGrowth => {
+                self.private_context_tokens()
+                    .saturating_add(decode_buffer_tokens) as f64
+            }
+        }
+    }
+
+    pub(crate) fn accounted_private_tokens_with_request(
+        &self,
+        context_tokens: usize,
+        output_tokens: Option<usize>,
+        decode_buffer_tokens: usize,
+        admission_mode: OutputReservationAdmissionMode,
+    ) -> f64 {
+        let context_total = self
+            .active_request_reservations
+            .values()
+            .map(|request| request.context_tokens)
+            .sum::<usize>()
+            .saturating_add(context_tokens)
+            .saturating_sub(self.shared_prefix_tokens);
+        let active_output = self
+            .active_request_reservations
+            .values()
+            .map(|request| match admission_mode {
+                OutputReservationAdmissionMode::Hard => {
+                    request.output_tokens.unwrap_or(decode_buffer_tokens)
+                }
+                OutputReservationAdmissionMode::ContinuousGrowth => {
+                    decode_buffer_tokens.max(request.generated_tokens)
+                }
+            })
+            .sum::<usize>();
+        let request_output = match admission_mode {
+            OutputReservationAdmissionMode::Hard => output_tokens.unwrap_or(decode_buffer_tokens),
+            OutputReservationAdmissionMode::ContinuousGrowth => decode_buffer_tokens,
+        };
+        context_total
+            .saturating_add(active_output)
+            .saturating_add(request_output) as f64
+    }
+
+    fn active_request_tokens(
+        &self,
+        decode_buffer_tokens: usize,
+        admission_mode: OutputReservationAdmissionMode,
+    ) -> Option<f64> {
+        if self.active_request_reservations.is_empty() {
+            return None;
+        }
+        let context_tokens = self
+            .active_request_reservations
+            .values()
+            .map(|request| request.context_tokens)
+            .sum::<usize>()
+            .saturating_sub(self.shared_prefix_tokens);
+        let output_tokens = self
+            .active_request_reservations
+            .values()
+            .map(|request| match admission_mode {
+                OutputReservationAdmissionMode::Hard => {
+                    request.output_tokens.unwrap_or(decode_buffer_tokens)
+                }
+                OutputReservationAdmissionMode::ContinuousGrowth => {
+                    decode_buffer_tokens.max(request.generated_tokens)
+                }
+            })
+            .sum::<usize>();
+        Some(context_tokens.saturating_add(output_tokens) as f64)
+    }
+
+    pub(crate) fn private_context_tokens(&self) -> usize {
+        self.estimated_context_tokens
+            .saturating_sub(self.shared_prefix_tokens)
+    }
+
+    pub(crate) fn effective_output_reservation(&self, decode_buffer_tokens: usize) -> usize {
+        if !self.active_request_reservations.is_empty() {
+            return self
+                .active_request_reservations
+                .values()
+                .map(|request| request.output_tokens.unwrap_or(decode_buffer_tokens))
+                .sum();
+        }
+        self.output_token_reservation
+            .unwrap_or(decode_buffer_tokens)
+    }
+
+    pub(crate) fn begin_request_progress(
+        &mut self,
+        attempt_id: u64,
+        context_tokens: usize,
+        output_tokens: Option<usize>,
+    ) {
+        self.active_request_reservations.insert(
+            attempt_id,
+            ActiveRequestReservation {
+                context_tokens,
+                output_tokens,
+                generated_tokens: 0,
+                progress_observed: false,
+            },
+        );
+    }
+
+    pub(crate) fn observe_generation_progress(
+        &mut self,
+        attempt_id: u64,
+        generated_tokens: usize,
+    ) -> bool {
+        let Some(request) = self.active_request_reservations.get_mut(&attempt_id) else {
+            return false;
+        };
+        if generated_tokens <= request.generated_tokens {
+            return false;
+        }
+        request.generated_tokens = generated_tokens;
+        request.progress_observed = true;
+        true
+    }
+
+    pub(crate) fn finish_request_progress(&mut self, attempt_id: u64) {
+        self.active_request_reservations.remove(&attempt_id);
+    }
+
+    pub(crate) fn current_request_generated_tokens(&self) -> usize {
+        self.active_request_reservations
+            .values()
+            .map(|request| request.generated_tokens)
+            .sum()
+    }
+
+    pub(crate) fn output_progress_observed(&self) -> bool {
+        self.active_request_reservations
+            .values()
+            .any(|request| request.progress_observed)
+    }
+
+    pub(crate) fn remaining_predicted_output_tokens(
+        &self,
+        decode_buffer_tokens: usize,
+        backend_usage_includes_generated: bool,
+    ) -> Option<usize> {
+        if self.active_request_reservations.is_empty()
+            || self
+                .active_request_reservations
+                .values()
+                .any(|request| !request.progress_observed || request.output_tokens.is_none())
+        {
+            return None;
+        }
+        Some(
+            self.active_request_reservations
+                .values()
+                .map(|request| {
+                    let accounted_generated = if backend_usage_includes_generated {
+                        request.generated_tokens
+                    } else {
+                        request.generated_tokens.max(decode_buffer_tokens)
+                    };
+                    request
+                        .output_tokens
+                        .unwrap_or_default()
+                        .saturating_sub(accounted_generated)
+                })
+                .sum(),
+        )
     }
 
     pub(crate) fn private_tokens_with_output(

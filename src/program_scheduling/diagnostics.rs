@@ -34,6 +34,11 @@ pub struct ProgramDiagnostic {
     pub request_priority: i64,
     pub request_deadline_seconds: Option<f64>,
     pub expected_output_tokens: Option<usize>,
+    pub output_reservation_tokens: usize,
+    pub output_reservation_source: &'static str,
+    pub current_request_generated_tokens: usize,
+    pub remaining_predicted_output_tokens: Option<usize>,
+    pub output_progress_observed: bool,
     pub kv_retention_ttl_seconds: Option<f64>,
     pub home_target: Option<String>,
     pub last_target: Option<String>,
@@ -268,6 +273,17 @@ impl ProgramScheduler {
                     expected_output_tokens: request_hints
                         .and_then(|hints| hints.expected_output_tokens)
                         .or(decision.output_token_reservation),
+                    output_reservation_tokens: decision.effective_output_reservation(
+                        self.config.progress_ttl.decode_buffer_tokens,
+                    ),
+                    output_reservation_source: decision
+                        .output_token_reservation_source
+                        .map_or("default", |source| source.as_str()),
+                    current_request_generated_tokens: decision.current_request_generated_tokens(),
+                    remaining_predicted_output_tokens: decision.output_token_reservation.map(
+                        |tokens| tokens.saturating_sub(decision.current_request_generated_tokens()),
+                    ),
+                    output_progress_observed: decision.output_progress_observed(),
                     kv_retention_ttl_seconds: request_hints
                         .and_then(|hints| hints.kv_retention_ttl)
                         .map(|ttl| ttl.as_secs_f64()),
@@ -279,11 +295,18 @@ impl ProgramScheduler {
                     shared_prefix_freshness_remaining_seconds: decision
                         .shared_prefix_fresh_until
                         .map(|deadline| deadline.saturating_duration_since(now).as_secs_f64()),
-                    logical_tokens: decision
-                        .estimated_context_tokens
-                        .saturating_add(self.config.progress_ttl.decode_buffer_tokens),
+                    logical_tokens: decision.estimated_context_tokens.saturating_add(
+                        decision.effective_output_reservation(
+                            self.config.progress_ttl.decode_buffer_tokens,
+                        ),
+                    ),
                     private_tokens: decision
-                        .private_tokens(self.config.progress_ttl.decode_buffer_tokens)
+                        .accounted_private_tokens(
+                            self.config.progress_ttl.decode_buffer_tokens,
+                            self.config
+                                .prediction_profile
+                                .output_reservation_admission_mode,
+                        )
                         .round() as usize,
                     in_flight_requests: runtime.in_flight_requests,
                     waiting_requests: runtime.waiting_requests,
